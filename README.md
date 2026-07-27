@@ -38,7 +38,6 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
 | `UWF-Aulas.py` | Port a Python + Tkinter, mismo comportamiento. |
 | `UWFAulas.bat` | Lanzador del `.py`. |
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
-| `UWF-Aulas-contexto.md` | Documento de traspaso con el contexto completo del proyecto, decisiones tomadas y mejoras pendientes. |
 
 ## Uso
 
