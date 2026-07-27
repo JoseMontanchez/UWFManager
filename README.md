@@ -1,4 +1,4 @@
-# UWFFreezer (UWF Aulas)
+# UWFManager
 
 Herramienta para gestionar el **Unified Write Filter (UWF)** de Windows. Sustituye el *servicing mode* nativo de UWF (fragil y que no
 cubre software de terceros como el antivirus) por una ventana de mantenimiento controlada,
