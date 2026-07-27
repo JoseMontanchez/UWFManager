@@ -1,19 +1,8 @@
 # UWFFreezer (UWF Aulas)
 
-Herramienta para gestionar el **Unified Write Filter (UWF)** de Windows en las aulas de
-la Universitat de Valencia. Sustituye el *servicing mode* nativo de UWF (fragil y que no
+Herramienta para gestionar el **Unified Write Filter (UWF)** de Windows. Sustituye el *servicing mode* nativo de UWF (fragil y que no
 cubre software de terceros como el antivirus) por una ventana de mantenimiento controlada,
 con una GUI pensada para que un tecnico la use en el aula sin margen de error.
-
-## Problema que resuelve
-
-Las aulas usan un unico usuario local (`Profesor`, autenticado via pGina contra el LDAP de
-la UV) compartido por todo el profesorado. Sin proteccion, cada profesor deja basura en el
-perfil (escritorio, descargas, sesiones abiertas de Outlook/Teams, credenciales guardadas)
-y hay riesgo de fuga de datos entre profesores. La solucion es proteger `C:` con UWF: todo
-lo que se escribe en una sesion se descarta al reiniciar. El unico punto delicado es como
-aplicar actualizaciones (Windows Update, Kaspersky, etc.) sin depender del *servicing mode*
-de UWF.
 
 ## Que hace
 
@@ -51,9 +40,6 @@ de UWF.
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
 | `UWF-Aulas-contexto.md` | Documento de traspaso con el contexto completo del proyecto, decisiones tomadas y mejoras pendientes. |
 
-Solo hace falta llevar **una** de las dos versiones (PowerShell o Python) a las aulas junto
-con su lanzador; ambas hacen lo mismo.
-
 ## Uso
 
 - **Modo normal** (sin argumentos): abre la GUI. Pide privilegios de administrador y, la
@@ -80,14 +66,3 @@ pyinstaller --onefile --windowed --uac-admin --name UWF-Aulas UWF-Aulas.py
 
 El resultado queda en `dist\UWF-Aulas.exe`: un unico ejecutable, sin necesitar Python
 instalado en el equipo destino, que pide elevacion automaticamente al abrirse.
-
-## Limitaciones conocidas / a validar en un aula real
-
-- Las rutas de exclusion por defecto de Kaspersky pueden cambiar entre versiones del
-  antivirus; conviene revisarlas en un equipo real.
-- Si el Agente de Red de Kaspersky regenera su identificador en cada reinicio (por estar
-  bajo el overlay), pueden aparecer equipos duplicados en Kaspersky Security Center.
-- No probado con OneDrive / Known Folder Move activo en el perfil `Profesor`.
-
-Detalle completo de contexto, decisiones y mejoras pendientes en
-[`UWF-Aulas-contexto.md`](UWF-Aulas-contexto.md).
