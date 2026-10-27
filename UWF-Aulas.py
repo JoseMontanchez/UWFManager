@@ -9,8 +9,18 @@ Port a Python del script original UWF-Aulas.ps1 (copia exacta de comportamiento)
 
 Cambios v2 (heredados del original):
   - Corregidos los umbrales del overlay (aviso < critico) y validacion
-  - Pestana Overlay: tipo (RAM/Disco), tamano y umbrales configurables
+  - Pestana Uso del disco: tipo (RAM/Disco), tamano y umbrales configurables
   - Exclusiones por programa: detecta lo instalado y propone carpetas/claves
+
+Cambios v3:
+  - Cola de cambios pendientes (pendientes.json): la GUI encola exclusiones y uso del
+    disco, y nada llega a UWF hasta pulsar "Aplicar cambios y reiniciar". La lista se
+    ve aunque UWF no este disponible en el equipo.
+  - Fase 'aplicando': si un pendiente exige el filtro desactivado (tipo o tamano), la
+    herramienta abre la ventana de mantenimiento sola y el vigilante la cierra tras
+    aplicar la cola, volviendo a proteger el equipo.
+  - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
+    claves de los perfiles JSON) se conserva el termino de UWF.
 
 Notas del port:
   - Para leer el estado de UWF se usa WMI (root\\standardcimv2\\embedded) via el
@@ -48,6 +58,7 @@ Base       = os.path.join(os.environ.get('ProgramData', r'C:\ProgramData'), 'UWF
 CfgPath    = os.path.join(Base, 'config.json')
 EstadoPath = os.path.join(Base, 'estado.json')
 PerfilPath = os.path.join(Base, 'perfil-exclusiones.json')
+PendPath   = os.path.join(Base, 'pendientes.json')
 LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
@@ -316,6 +327,33 @@ def test_umbrales_validos(aviso, critico, tamano):
     return aviso > 0 and critico > aviso and tamano >= critico
 
 
+def aplicar_tipo_tamano(tipo, tamano_mb):
+    """Aplica tipo (RAM/Disco) y tamano del overlay. UWF solo lo admite con el filtro DESACTIVADO:
+    comprobarlo es responsabilidad de quien llama. Devuelve la lista de errores."""
+    errores = []
+    t = 'disk' if tipo == 'Disco' else 'ram'
+    r1 = invoke_uwf(['overlay', 'set-type', t])
+    if not r1['Ok']:
+        errores.append('set-type: %s' % r1['Salida'])
+    r2 = invoke_uwf(['overlay', 'set-size', '%d' % int(tamano_mb)])
+    if not r2['Ok']:
+        errores.append('set-size: %s' % r2['Salida'])
+    return errores
+
+
+def aplicar_umbrales(aviso_mb, critico_mb):
+    """Aplica los umbrales de aviso y critico del overlay. Se pueden cambiar en cualquier momento,
+    con el filtro activo o no. Devuelve la lista de errores."""
+    errores = []
+    r1 = invoke_uwf(['overlay', 'set-warningthreshold', '%d' % int(aviso_mb)])
+    if not r1['Ok']:
+        errores.append('set-warningthreshold: %s' % r1['Salida'])
+    r2 = invoke_uwf(['overlay', 'set-criticalthreshold', '%d' % int(critico_mb)])
+    if not r2['Ok']:
+        errores.append('set-criticalthreshold: %s' % r2['Salida'])
+    return errores
+
+
 def aplicar_overlay(tipo, tamano_mb, aviso_mb, critico_mb, filtro_activo):
     """Aplica tipo/tamano/umbrales del overlay via uwfmgr. Tipo y tamano solo si el filtro esta desactivado;
     los umbrales se aplican siempre. Devuelve la lista de avisos/errores en vez de lanzar excepcion parcial."""
@@ -330,24 +368,13 @@ def aplicar_overlay(tipo, tamano_mb, aviso_mb, critico_mb, filtro_activo):
     # Tipo y tamano solo se pueden cambiar con el filtro desactivado
     if filtro_activo:
         errores.append(
-            'El tipo y el tamano del overlay solo se pueden cambiar con la proteccion '
+            'El tamano y el sitio del uso del disco solo se pueden cambiar con la proteccion '
             'desactivada. Hazlo durante una ventana de mantenimiento. Los umbrales si se han aplicado.'
         )
     else:
-        t = 'disk' if tipo == 'Disco' else 'ram'
-        r1 = invoke_uwf(['overlay', 'set-type', t])
-        if not r1['Ok']:
-            errores.append('set-type: %s' % r1['Salida'])
-        r2 = invoke_uwf(['overlay', 'set-size', '%d' % int(tamano_mb)])
-        if not r2['Ok']:
-            errores.append('set-size: %s' % r2['Salida'])
+        errores.extend(aplicar_tipo_tamano(tipo, tamano_mb))
 
-    r3 = invoke_uwf(['overlay', 'set-warningthreshold', '%d' % int(aviso_mb)])
-    if not r3['Ok']:
-        errores.append('set-warningthreshold: %s' % r3['Salida'])
-    r4 = invoke_uwf(['overlay', 'set-criticalthreshold', '%d' % int(critico_mb)])
-    if not r4['Ok']:
-        errores.append('set-criticalthreshold: %s' % r4['Salida'])
+    errores.extend(aplicar_umbrales(aviso_mb, critico_mb))
 
     escribir_log('AplicarOverlay', 'OK' if not errores else 'PARCIAL',
                  'tipo=%s tamano=%s aviso=%s critico=%s' % (tipo, tamano_mb, aviso_mb, critico_mb))
@@ -439,6 +466,236 @@ def remove_exclusion_registro(clave):
     escribir_log('QuitarExclusionRegistro', 'OK' if r['Ok'] else 'ERROR', c)
     if not r['Ok']:
         raise RuntimeError(r['Salida'])
+
+
+# =============================================================================
+#  Cambios pendientes
+#
+#  El tecnico encola en pendientes.json todo lo que quiere cambiar (exclusiones y uso
+#  del disco) y lo aplica de una vez con "Aplicar cambios y reiniciar". Dos razones:
+#  la GUI puede mostrar lo decidido aunque UWF no este disponible todavia en el equipo,
+#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola para
+#  aplicarse en el arranque siguiente.
+# =============================================================================
+
+def pendientes_vacios(p):
+    """True si no hay ningun cambio encolado."""
+    return not p.get('exclusiones') and not p.get('disco')
+
+
+def leer_pendientes():
+    """Lee pendientes.json descartando entradas corruptas, o devuelve una cola vacia."""
+    p = {'exclusiones': [], 'disco': None}
+    if os.path.isfile(PendPath):
+        try:
+            with open(PendPath, 'r', encoding='utf-8-sig') as fh:
+                guardado = json.load(fh)
+            ex = guardado.get('exclusiones')
+            if isinstance(ex, list):
+                p['exclusiones'] = [
+                    e for e in ex
+                    if isinstance(e, dict)
+                    and e.get('tipo') in ('archivo', 'registro')
+                    and e.get('accion') in ('add', 'remove')
+                    and e.get('valor')
+                ]
+            d = guardado.get('disco')
+            if isinstance(d, dict) and d.get('tipo') in ('RAM', 'Disco') \
+                    and test_umbrales_validos(d.get('avisoMB', 0), d.get('criticoMB', 0), d.get('tamanoMB', 0)):
+                p['disco'] = d
+        except Exception:
+            pass
+    return p
+
+
+def guardar_pendientes(p):
+    """Escribe pendientes.json, o lo borra si ya no queda nada encolado."""
+    inicializar_carpeta()
+    if pendientes_vacios(p):
+        try:
+            os.remove(PendPath)
+        except OSError:
+            pass
+        return
+    datos = {
+        'version':     1,
+        'actualizado': _now('%Y-%m-%dT%H:%M:%S'),
+        'tecnico':     os.environ.get('USERNAME', ''),
+        'equipo':      os.environ.get('COMPUTERNAME', socket.gethostname()),
+        'exclusiones': p.get('exclusiones') or [],
+        'disco':       p.get('disco'),
+    }
+    with open(PendPath, 'w', encoding='utf-8') as fh:
+        json.dump(datos, fh, indent=2, ensure_ascii=True)
+
+
+def _valor_pendiente(tipo, valor):
+    """Forma canonica con la que se guarda un valor encolado (conserva mayusculas y minusculas,
+    porque es la que se le pasa tal cual a uwfmgr)."""
+    if tipo == 'registro':
+        return normalizar_clave_registro(valor)
+    return valor.strip().rstrip('\\')
+
+
+def _clave_pendiente(tipo, valor):
+    """Clave con la que se comparan dos valores encolados. Va en minusculas porque las rutas y
+    las claves de registro de Windows no distinguen mayusculas, igual que el '-eq' del .ps1."""
+    return _valor_pendiente(tipo, valor).lower()
+
+
+def anadir_pendiente_exclusion(p, tipo, accion, valor):
+    """Encola anadir o quitar una exclusion.
+
+    Valida al encolar, no al aplicar, para que el tecnico vea el error en el momento en que
+    lo decide. Si ya habia encolado el pendiente opuesto sobre el mismo valor, se anulan
+    entre si: vuelve al estado que tiene el equipo ahora. Devuelve True si la cola cambio.
+    """
+    v = _valor_pendiente(tipo, valor)
+    if not v:
+        raise ValueError('Ruta o clave vacia.')
+    if accion == 'add':
+        if tipo == 'archivo' and test_exclusion_peligrosa(v):
+            raise ValueError('Ruta prohibida: excluirla rompe Windows Update (%s)' % v)
+        if tipo == 'registro' and not re.match(r'^HKLM\\', v):
+            raise ValueError('UWF solo admite exclusiones de registro bajo HKLM.')
+
+    clave = _clave_pendiente(tipo, v)
+    for e in list(p['exclusiones']):
+        if e['tipo'] == tipo and _clave_pendiente(tipo, e['valor']) == clave:
+            if e['accion'] == accion:
+                return False
+            p['exclusiones'].remove(e)
+            return True
+
+    p['exclusiones'].append({'tipo': tipo, 'accion': accion, 'valor': v})
+    return True
+
+
+def quitar_pendiente_exclusion(p, tipo, valor):
+    """Saca de la cola un pendiente concreto. Devuelve True si habia algo que sacar."""
+    clave = _clave_pendiente(tipo, valor)
+    antes = len(p['exclusiones'])
+    p['exclusiones'] = [
+        e for e in p['exclusiones']
+        if not (e['tipo'] == tipo and _clave_pendiente(tipo, e['valor']) == clave)
+    ]
+    return len(p['exclusiones']) != antes
+
+
+def fijar_pendiente_disco(p, tipo, tamano_mb, aviso_mb, critico_mb):
+    """Encola la configuracion del uso del disco, validando la regla de umbrales al encolar."""
+    if tipo not in ('RAM', 'Disco'):
+        raise ValueError('Tipo no valido: %s' % tipo)
+    if not test_umbrales_validos(aviso_mb, critico_mb, tamano_mb):
+        raise ValueError(
+            'Umbrales no validos: debe cumplirse aviso < critico <= tamano '
+            '(has puesto %s / %s / %s MB).' % (aviso_mb, critico_mb, tamano_mb)
+        )
+    p['disco'] = {
+        'tipo':      tipo,
+        'tamanoMB':  int(tamano_mb),
+        'avisoMB':   int(aviso_mb),
+        'criticoMB': int(critico_mb),
+    }
+
+
+def disco_pendiente_exige_filtro_off(p, uwf):
+    """True si el pendiente de disco cambia el tipo o el tamano, que UWF solo admite con el
+    filtro desactivado. Si solo cambian los umbrales no hace falta ventana de mantenimiento."""
+    d = p.get('disco')
+    if not d:
+        return False
+    if not uwf.get('Instalado'):
+        return True
+    return (d['tipo'] != uwf.get('OverlayTipo')
+            or int(d['tamanoMB']) != int(uwf.get('OverlayMaxMB') or 0))
+
+
+def resumen_pendientes(p):
+    """Lineas legibles con lo que hay encolado, para la GUI y los mensajes de confirmacion."""
+    lineas = []
+    for e in p.get('exclusiones') or []:
+        verbo = 'Anadir' if e['accion'] == 'add' else 'Quitar'
+        que = 'carpeta/archivo' if e['tipo'] == 'archivo' else 'clave de registro'
+        lineas.append('%s %s: %s' % (verbo, que, e['valor']))
+    d = p.get('disco')
+    if d:
+        lineas.append('Uso del disco: %s, %s MB (aviso %s, critico %s)'
+                      % (d['tipo'], d['tamanoMB'], d['avisoMB'], d['criticoMB']))
+    return lineas
+
+
+def aplicar_pendientes(filtro_activo):
+    """Aplica todo lo encolado que se pueda aplicar ahora y conserva el resto en la cola.
+
+    Exclusiones y umbrales se pueden registrar con el filtro activo o no (surten efecto tras
+    reiniciar). El tipo y el tamano exigen el filtro desactivado: con la proteccion activa se
+    quedan encolados para aplicarse en el arranque de mantenimiento.
+
+    Devuelve {Aplicados, Errores, Restantes, EsperandoFiltroOff}.
+    """
+    p = leer_pendientes()
+    res = {'Aplicados': [], 'Errores': [], 'Restantes': 0, 'EsperandoFiltroOff': False}
+    if pendientes_vacios(p):
+        return res
+
+    quedan = []
+    for e in p['exclusiones']:
+        etiqueta = '%s %s' % ('anadir' if e['accion'] == 'add' else 'quitar', e['valor'])
+        try:
+            if e['tipo'] == 'archivo':
+                if e['accion'] == 'add':
+                    add_exclusion_archivo(e['valor'])
+                else:
+                    remove_exclusion_archivo(e['valor'])
+            else:
+                if e['accion'] == 'add':
+                    add_exclusion_registro(e['valor'])
+                else:
+                    remove_exclusion_registro(e['valor'])
+            res['Aplicados'].append(etiqueta)
+        except Exception as ex:
+            res['Errores'].append('%s -> %s' % (etiqueta, ex))
+            quedan.append(e)
+
+    disco = p.get('disco')
+    disco_queda = None
+    if disco:
+        try:
+            errores = aplicar_umbrales(disco['avisoMB'], disco['criticoMB'])
+            if errores:
+                res['Errores'].extend(errores)
+            else:
+                res['Aplicados'].append('umbrales %s / %s MB' % (disco['avisoMB'], disco['criticoMB']))
+
+            if filtro_activo:
+                # Tipo y tamano no se pueden tocar con la proteccion activa. Solo se quedan
+                # encolados si de verdad cambian algo: si ya coinciden, no hay nada que hacer.
+                if disco_pendiente_exige_filtro_off(p, get_estado_uwf()):
+                    disco_queda = disco
+                    res['EsperandoFiltroOff'] = True
+                else:
+                    res['Aplicados'].append('uso del disco: ya estaba en %s, %s MB'
+                                            % (disco['tipo'], disco['tamanoMB']))
+            else:
+                errores = aplicar_tipo_tamano(disco['tipo'], disco['tamanoMB'])
+                if errores:
+                    res['Errores'].extend(errores)
+                    disco_queda = disco
+                else:
+                    res['Aplicados'].append('uso del disco %s, %s MB'
+                                            % (disco['tipo'], disco['tamanoMB']))
+        except Exception as ex:
+            res['Errores'].append('uso del disco -> %s' % ex)
+            disco_queda = disco
+
+    guardar_pendientes({'exclusiones': quedan, 'disco': disco_queda})
+    res['Restantes'] = len(quedan) + (1 if disco_queda else 0)
+    escribir_log('AplicarPendientes',
+                 'OK' if (not res['Errores'] and not res['Restantes']) else 'PARCIAL',
+                 'aplicados=%d restantes=%d errores=%d'
+                 % (len(res['Aplicados']), res['Restantes'], len(res['Errores'])))
+    return res
 
 
 # =============================================================================
@@ -753,6 +1010,22 @@ def iniciar_mantenimiento():
     escribir_log('IniciarMantenimiento', 'OK', 'filtro desactivado, pendiente de reinicio')
 
 
+def iniciar_aplicacion_pendientes():
+    """Abre una ventana de mantenimiento automatica, solo para aplicar los pendientes que exigen
+    el filtro desactivado (tipo y tamano del uso del disco).
+
+    Se distingue de un mantenimiento normal por la fase 'aplicando': el vigilante la reconoce en
+    el arranque siguiente, aplica la cola, vuelve a proteger el equipo y reinicia sin que el
+    tecnico tenga que hacer nada mas.
+    """
+    r = invoke_uwf(['filter', 'disable'])
+    if not r['Ok']:
+        raise RuntimeError('No se ha podido desactivar el filtro: %s' % r['Salida'])
+    guardar_estado('aplicando')
+    escribir_log('IniciarAplicacionPendientes', 'OK',
+                 'filtro desactivado para aplicar la cola, pendiente de reinicio')
+
+
 def finalizar_mantenimiento():
     """Paso 3 del flujo de mantenimiento: reactiva el filtro y marca la fase 'verificando'."""
     r = invoke_uwf(['filter', 'enable'])
@@ -780,7 +1053,10 @@ def ejecutar_vigilante():
 
     Sin fase abierta: solo avisa si el filtro esta desactivado sin motivo.
     Fase 'verificando': confirma que el filtro volvio a activarse tras el mantenimiento (si no, reintenta).
-    Fase 'mantenimiento': si lleva abierta mas horas que el limite configurado, reactiva la proteccion sola.
+    Fase 'aplicando': arranque abierto por la herramienta para volcar la cola de pendientes; los
+      aplica, vuelve a proteger el equipo y reinicia.
+    Fase 'mantenimiento': aplica lo que haya encolado aprovechando que no hay proteccion y, si la
+      ventana lleva abierta mas horas que el limite configurado, reactiva la proteccion sola.
     """
     estado = leer_estado()
     cfg = leer_config()
@@ -793,7 +1069,33 @@ def ejecutar_vigilante():
         return
 
     fase = estado.get('fase')
-    if fase == 'verificando':
+    if fase == 'aplicando':
+        # El equipo ha arrancado sin proteccion solo para volcar la cola. Pase lo que pase con los
+        # pendientes, el filtro tiene que quedar activo otra vez antes de devolver el equipo al aula.
+        if uwf['FiltroActual']:
+            escribir_log('Vigilante', 'ERROR',
+                         'Se esperaba el filtro desactivado para aplicar la cola; se deja para el tecnico')
+            guardar_estado('verificando')
+            return
+        try:
+            res = aplicar_pendientes(False)
+            escribir_log('Vigilante',
+                         'OK' if (not res['Errores'] and not res['Restantes']) else 'PARCIAL',
+                         'Cola aplicada: %d cambios, %d restantes, %d errores'
+                         % (len(res['Aplicados']), res['Restantes'], len(res['Errores'])))
+            for err in res['Errores']:
+                escribir_log('Vigilante', 'ERROR', err)
+        except Exception as ex:
+            escribir_log('Vigilante', 'ERROR', 'Al aplicar la cola: %s' % ex)
+        try:
+            r = invoke_uwf(['filter', 'enable'])
+            if not r['Ok']:
+                escribir_log('Vigilante', 'ERROR', 'No se ha podido reactivar el filtro: %s' % r['Salida'])
+            guardar_estado('verificando')
+            reiniciar_equipo('cierre automatico tras aplicar los cambios pendientes')
+        except Exception as ex:
+            escribir_log('Vigilante', 'ERROR', str(ex))
+    elif fase == 'verificando':
         if uwf['FiltroActual']:
             escribir_log('Vigilante', 'OK', 'Mantenimiento cerrado, filtro activo y verificado')
             guardar_estado(None)
@@ -805,6 +1107,20 @@ def ejecutar_vigilante():
             except Exception:
                 pass
     elif fase == 'mantenimiento':
+        # Arranque de mantenimiento: se aprovecha que no hay proteccion para volcar la cola.
+        # Aqui no se reinicia, porque el tecnico esta trabajando en el equipo.
+        if not uwf['FiltroActual'] and not pendientes_vacios(leer_pendientes()):
+            try:
+                res = aplicar_pendientes(False)
+                escribir_log('Vigilante',
+                             'OK' if (not res['Errores'] and not res['Restantes']) else 'PARCIAL',
+                             'Cola aplicada en mantenimiento: %d cambios, %d restantes, %d errores'
+                             % (len(res['Aplicados']), res['Restantes'], len(res['Errores'])))
+                for err in res['Errores']:
+                    escribir_log('Vigilante', 'ERROR', err)
+            except Exception as ex:
+                escribir_log('Vigilante', 'ERROR', 'Al aplicar la cola en mantenimiento: %s' % ex)
+
         horas = (datetime.now() - datetime.fromisoformat(estado['inicio'])).total_seconds() / 3600.0
         maximo = 8
         if cfg.get('horasMaxMantenimiento'):
@@ -939,8 +1255,11 @@ def mostrar_dialogo_programa(padre):
 # =============================================================================
 
 def mostrar_interfaz():
-    """Construye y muestra la ventana principal (cinco pestanas: Estado, Exclusiones, Overlay,
-    Mantenimiento, Configuracion) y arranca el bucle de eventos de Tkinter."""
+    """Construye y muestra la ventana principal (cinco pestanas: Estado, Exclusiones, Uso del
+    disco, Mantenimiento, Configuracion) y arranca el bucle de eventos de Tkinter.
+
+    Toda la ventana encola cambios; el unico sitio donde se aplican es la barra de pendientes
+    de abajo, visible desde cualquier pestana."""
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -949,6 +1268,7 @@ def mostrar_interfaz():
     NARANJA = '#C88200'
     AMBAR  = '#965000'
     GRIS   = '#808080'
+    AZUL   = '#1F5FA9'
     ROJO_FILA = '#A03C3C'
 
     form = tk.Tk()
@@ -974,13 +1294,26 @@ def mostrar_interfaz():
     lbl_barra = tk.Label(barra, text='Listo', anchor='w')
     lbl_barra.pack(side='left', padx=4)
 
+    # ---- Barra de cambios pendientes (visible desde cualquier pestana) ----
+    # Es el unico punto donde se aplica algo: el resto de la ventana solo encola.
+    barra_pend = tk.Frame(form, height=56, bd=1, relief='raised')
+    barra_pend.pack(side='bottom', fill='x')
+    barra_pend.pack_propagate(False)
+    lbl_pend = tk.Label(barra_pend, anchor='w', justify='left', font=('Segoe UI', 9, 'bold'))
+    lbl_pend.place(x=12, y=8, width=560, height=40)
+    btn_aplicar_pend = tk.Button(barra_pend, text='Aplicar cambios y reiniciar',
+                                 font=('Segoe UI', 9, 'bold'))
+    btn_aplicar_pend.place(x=588, y=11, width=200, height=34)
+    btn_descartar_pend = tk.Button(barra_pend, text='Descartar')
+    btn_descartar_pend.place(x=798, y=11, width=110, height=34)
+
     # ---- Cuaderno de pestanas ----
     tabs = ttk.Notebook(form)
     tabs.pack(fill='both', expand=True)
 
     tab_estado  = ttk.Frame(tabs); tabs.add(tab_estado,  text='Estado')
     tab_excl    = ttk.Frame(tabs); tabs.add(tab_excl,    text='Exclusiones')
-    tab_overlay = ttk.Frame(tabs); tabs.add(tab_overlay, text='Overlay')
+    tab_overlay = ttk.Frame(tabs); tabs.add(tab_overlay, text='Uso del disco')
     tab_mant    = ttk.Frame(tabs); tabs.add(tab_mant,    text='Mantenimiento')
     tab_cfg     = ttk.Frame(tabs); tabs.add(tab_cfg,     text='Configuracion')
 
@@ -1000,12 +1333,15 @@ def mostrar_interfaz():
     btn_refrescar.place(x=560, y=368, width=160, height=34)
 
     # ========================= PESTANA EXCLUSIONES ===========================
-    cols = ('tipo', 'ruta', 'existe')
+    cols = ('estado', 'tipo', 'ruta', 'existe')
     lv = ttk.Treeview(tab_excl, columns=cols, show='headings')
-    lv.heading('tipo', text='Tipo'); lv.column('tipo', width=90, anchor='w')
-    lv.heading('ruta', text='Ruta o clave'); lv.column('ruta', width=610, anchor='w')
-    lv.heading('existe', text='Existe'); lv.column('existe', width=160, anchor='w')
+    lv.heading('estado', text='Estado'); lv.column('estado', width=150, anchor='w')
+    lv.heading('tipo', text='Tipo'); lv.column('tipo', width=80, anchor='w')
+    lv.heading('ruta', text='Ruta o clave'); lv.column('ruta', width=500, anchor='w')
+    lv.heading('existe', text='Existe'); lv.column('existe', width=140, anchor='w')
     lv.tag_configure('noexiste', foreground=ROJO_FILA)
+    lv.tag_configure('pend_add', foreground=AZUL)
+    lv.tag_configure('pend_del', foreground=ROJO)
     lv.place(x=16, y=16, width=880, height=380)
 
     btn_add_programa = tk.Button(tab_excl, text='Anadir por programa...', font=('Segoe UI', 9, 'bold'))
@@ -1025,19 +1361,21 @@ def mostrar_interfaz():
 
     lbl_aviso = tk.Label(
         tab_excl, fg=AMBAR, justify='left', wraplength=880,
-        text='Las exclusiones solo surten efecto tras reiniciar. Todo lo excluido se guarda de verdad '
-             'en el disco: excluye lo minimo.')
+        text='Los cambios se quedan en la lista como PENDIENTES hasta que pulses "Aplicar cambios y '
+             'reiniciar" abajo. Todo lo excluido se guarda de verdad en el disco: excluye lo minimo.')
     lbl_aviso.place(x=16, y=448, width=880, height=34)
 
-    # =========================== PESTANA OVERLAY =============================
+    # ======================== PESTANA USO DEL DISCO ==========================
     lbl_ov1 = tk.Label(tab_overlay, justify='left', anchor='nw', wraplength=880, text=(
-        'El overlay es el espacio donde se guardan los cambios temporales de cada sesion. '
-        'Se vacia al reiniciar.\n\n'
+        'Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al\n'
+        'disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide\n'
+        'cuanto espacio se reserva para eso y donde.\n\n'
         '- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.\n'
         '- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.\n\n'
-        'El tipo y el tamano solo se pueden cambiar con la proteccion DESACTIVADA (durante un mantenimiento).\n'
-        'Los umbrales de aviso y critico se pueden cambiar en cualquier momento.'))
-    lbl_ov1.place(x=16, y=16, width=880, height=150)
+        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y\n'
+        'el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se\n'
+        'abrira la ventana de mantenimiento sola al aplicar.'))
+    lbl_ov1.place(x=16, y=16, width=880, height=160)
 
     gb_tipo = tk.LabelFrame(tab_overlay, text='Donde se guarda')
     gb_tipo.place(x=16, y=176, width=240, height=90)
@@ -1068,7 +1406,8 @@ def mostrar_interfaz():
     _set_spin(num_av, 2560)
     _set_spin(num_cr, 3584)
 
-    btn_aplicar_ov = tk.Button(tab_overlay, text='Aplicar configuracion del overlay')
+    btn_aplicar_ov = tk.Button(tab_overlay, text='Anadir a los cambios pendientes',
+                               font=('Segoe UI', 9, 'bold'))
     btn_aplicar_ov.place(x=16, y=284, width=280, height=40)
     lbl_ov_estado = tk.Label(tab_overlay, justify='left', anchor='nw', wraplength=880)
     lbl_ov_estado.place(x=16, y=340, width=880, height=60)
@@ -1110,11 +1449,14 @@ def mostrar_interfaz():
 
     # ============================ LOGICA GUI =================================
     def refrescar():
-        """Vuelve a leer el estado de UWF y redibuja toda la ventana: banner, pestana Estado,
-        campos de Overlay, lista de Exclusiones y las ultimas lineas del log."""
+        """Vuelve a leer el estado de UWF y la cola de pendientes, y redibuja toda la ventana:
+        banner, pestana Estado, campos de Uso del disco, lista de Exclusiones (pendientes
+        incluidos), barra de pendientes y las ultimas lineas del log."""
         try:
             u = get_estado_uwf()
             es = leer_estado()
+            pend = leer_pendientes()
+            lineas_pend = resumen_pendientes(pend)
 
             lineas = []
             lineas.append('Equipo              : %s' % os.environ.get('COMPUTERNAME', ''))
@@ -1122,15 +1464,17 @@ def mostrar_interfaz():
             lineas.append('Filtro (sesion act.): %s' % ('ACTIVO' if u['FiltroActual'] else 'DESACTIVADO'))
             lineas.append('Filtro (tras reinic): %s' % ('ACTIVO' if u['FiltroSiguiente'] else 'DESACTIVADO'))
             lineas.append('Volumenes protegidos: %s' % (', '.join(u['VolumenesActual']) if u['VolumenesActual'] else 'ninguno'))
-            lineas.append('Overlay             : %s, maximo %s MB' % (u['OverlayTipo'], u['OverlayMaxMB']))
+            lineas.append('Uso del disco       : %s, maximo %s MB' % (u['OverlayTipo'], u['OverlayMaxMB']))
             lineas.append('Umbrales            : aviso %s MB, critico %s MB' % (u['OverlayAvisoMB'], u['OverlayCriticoMB']))
             if u['OverlayUsoMB'] >= 0:
-                lineas.append('Consumo del overlay : %s MB' % u['OverlayUsoMB'])
+                lineas.append('Espacio consumido   : %s MB' % u['OverlayUsoMB'])
             lineas.append('')
             if es:
                 lineas.append("Mantenimiento       : fase '%s' iniciada el %s por %s" % (es['fase'], es['inicio'], es['tecnico']))
             else:
                 lineas.append('Mantenimiento       : ninguno en curso')
+            lineas.append('Cambios pendientes  : %s' % (
+                '%d sin aplicar' % len(lineas_pend) if lineas_pend else 'ninguno'))
             if u['Error']:
                 lineas.append('')
                 lineas.append('Aviso: %s' % u['Error'])
@@ -1145,9 +1489,12 @@ def mostrar_interfaz():
                 barra_overlay['value'] = min(int(u['OverlayUsoMB']), int(u['OverlayMaxMB']))
 
             # Banner
-            if es and es.get('fase') == 'mantenimiento' and not u['FiltroActual']:
+            fase_abierta = es.get('fase') if es else None
+            if fase_abierta in ('mantenimiento', 'aplicando') and not u['FiltroActual']:
                 banner.config(bg=ROJO); lbl_banner.config(bg=ROJO,
-                    text='MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO')
+                    text=('APLICANDO CAMBIOS PENDIENTES  -  EL EQUIPO NO ESTA PROTEGIDO'
+                          if fase_abierta == 'aplicando'
+                          else 'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO'))
             elif u['FiltroActual']:
                 banner.config(bg=VERDE); lbl_banner.config(bg=VERDE,
                     text='PROTECCION ACTIVA  -  los cambios se descartan al reiniciar')
@@ -1160,8 +1507,19 @@ def mostrar_interfaz():
             btn_finalizar_m.config(state='normal' if (u['Instalado'] and not u['FiltroActual']) else 'disabled')
             btn_instalar.config(state='normal' if not u['Instalado'] else 'disabled')
 
-            # Pestana Overlay: reflejar estado actual y avisar si esta bloqueado
-            if u['Instalado']:
+            # Pestana Uso del disco: si hay algo encolado se muestran los valores pendientes
+            # (son los que el tecnico acaba de decidir); si no, el estado real del equipo.
+            if pend.get('disco'):
+                d = pend['disco']
+                var_tipo.set(d['tipo'])
+                _set_spin(num_tam, d['tamanoMB'])
+                _set_spin(num_av, d['avisoMB'])
+                _set_spin(num_cr, d['criticoMB'])
+                lbl_ov_estado.config(fg=AZUL,
+                    text='Estos valores estan PENDIENTES: todavia no son los del equipo. Pulsa '
+                         '"Aplicar cambios y reiniciar" abajo para que surtan efecto, o "Descartar" '
+                         'para volver a la configuracion real.')
+            elif u['Instalado']:
                 var_tipo.set('RAM' if u['OverlayTipo'] == 'RAM' else 'Disco')
                 if u['OverlayMaxMB'] >= 512:
                     _set_spin(num_tam, min(u['OverlayMaxMB'], 65536))
@@ -1171,25 +1529,66 @@ def mostrar_interfaz():
                     _set_spin(num_cr, min(u['OverlayCriticoMB'], 65536))
                 if u['FiltroActual']:
                     lbl_ov_estado.config(fg=AMBAR,
-                        text='La proteccion esta ACTIVA: ahora mismo solo se pueden cambiar los umbrales. '
-                             'Para cambiar tipo o tamano, inicia antes un mantenimiento.')
+                        text='La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. '
+                             'Si los cambias, al aplicar se abrira la ventana de mantenimiento sola y el '
+                             'equipo se reiniciara dos veces.')
                 else:
                     lbl_ov_estado.config(fg=VERDE,
                         text='La proteccion esta desactivada: se puede cambiar todo. '
                              'Los cambios se aplican tras reiniciar.')
+            else:
+                lbl_ov_estado.config(fg=GRIS,
+                    text='UWF no esta instalado en este equipo: puedes dejar la configuracion preparada '
+                         'como pendiente, pero no se aplicara hasta instalar la caracteristica.')
 
-            # Exclusiones
+            # Exclusiones: primero la cola de pendientes, que se ve siempre aunque UWF no este
+            # disponible en este equipo; despues lo que ya esta activo en UWF.
             for fila in lv.get_children():
                 lv.delete(fila)
+            encolados = set()
+            for e in pend['exclusiones']:
+                existe = (os.path.exists(e['valor']) if e['tipo'] == 'archivo'
+                          else existe_clave_hklm(e['valor']))
+                encolados.add((e['tipo'], _clave_pendiente(e['tipo'], e['valor'])))
+                lv.insert('', 'end', values=(
+                    'PENDIENTE: anadir' if e['accion'] == 'add' else 'PENDIENTE: quitar',
+                    'Archivo' if e['tipo'] == 'archivo' else 'Registro',
+                    e['valor'],
+                    'si' if existe else 'NO EXISTE - revisar',
+                ), tags=('pend_add' if e['accion'] == 'add' else 'pend_del',))
+
             if u['Instalado']:
                 for a in get_exclusiones_archivo():
+                    if ('archivo', _clave_pendiente('archivo', a)) in encolados:
+                        continue
                     existe = os.path.exists(a)
-                    lv.insert('', 'end', values=('Archivo', a, 'si' if existe else 'NO EXISTE - revisar'),
+                    lv.insert('', 'end',
+                              values=('activa', 'Archivo', a, 'si' if existe else 'NO EXISTE - revisar'),
                               tags=() if existe else ('noexiste',))
                 for k in get_exclusiones_registro():
+                    if ('registro', _clave_pendiente('registro', k)) in encolados:
+                        continue
                     existe = existe_clave_hklm(k)
-                    lv.insert('', 'end', values=('Registro', k, 'si' if existe else 'NO EXISTE - revisar'),
+                    lv.insert('', 'end',
+                              values=('activa', 'Registro', k, 'si' if existe else 'NO EXISTE - revisar'),
                               tags=() if existe else ('noexiste',))
+
+            # Barra de cambios pendientes
+            if lineas_pend:
+                resumen = '  |  '.join(lineas_pend[:2])
+                if len(lineas_pend) > 2:
+                    resumen += '  |  y %d mas' % (len(lineas_pend) - 2)
+                plural = '' if len(lineas_pend) == 1 else 's'
+                lbl_pend.config(fg=AZUL, text='%d cambio%s pendiente%s de aplicar:\n%s'
+                                             % (len(lineas_pend), plural, plural, resumen))
+                btn_aplicar_pend.config(state='normal')
+                btn_descartar_pend.config(state='normal')
+            else:
+                lbl_pend.config(fg=GRIS,
+                    text='Sin cambios pendientes.\nLo que configures en Exclusiones o en Uso del disco '
+                         'aparecera aqui antes de aplicarse.')
+                btn_aplicar_pend.config(state='disabled')
+                btn_descartar_pend.config(state='disabled')
 
             # Log
             if os.path.isfile(LogPath):
@@ -1243,96 +1642,180 @@ def mostrar_interfaz():
             form.config(cursor='')
             messagebox.showerror('Error', str(ex))
 
+    def _encolar_exclusion(tipo, valor, accion='add'):
+        """Encola una exclusion y refresca la ventana. La validacion ocurre al encolar, asi que
+        el tecnico ve el error en el momento en que lo decide y no al aplicar."""
+        try:
+            p = leer_pendientes()
+            anadir_pendiente_exclusion(p, tipo, accion, valor)
+            guardar_pendientes(p)
+            escribir_log('EncolarExclusion', 'OK', '%s %s %s' % (accion, tipo, valor))
+            refrescar()
+        except Exception as ex:
+            messagebox.showerror('Error', str(ex))
+
     def on_add_programa():
-        """Boton 'Anadir por programa...': abre el dialogo y aplica las exclusiones aceptadas."""
+        """Boton 'Anadir por programa...': encola como pendientes las exclusiones aceptadas."""
         try:
             res = mostrar_dialogo_programa(form)
             if not res['Aceptado']:
                 return
+            p = leer_pendientes()
+            nuevos = 0
             errores = []
-            for c in res['Carpetas']:
-                try:
-                    add_exclusion_archivo(c)
-                except Exception as ex:
-                    errores.append('%s -> %s' % (c, ex))
-            for k in res['Claves']:
-                try:
-                    add_exclusion_registro(k)
-                except Exception as ex:
-                    errores.append('%s -> %s' % (k, ex))
+            for tipo, valores in (('archivo', res['Carpetas']), ('registro', res['Claves'])):
+                for v in valores:
+                    try:
+                        if anadir_pendiente_exclusion(p, tipo, 'add', v):
+                            nuevos += 1
+                    except Exception as ex:
+                        errores.append('%s -> %s' % (v, ex))
+            guardar_pendientes(p)
+            escribir_log('EncolarExclusiones', 'OK', 'por programa: %d encoladas' % nuevos)
             refrescar()
             if errores:
-                messagebox.showwarning('UWF Aulas', 'Anadido con avisos:\n\n' + '\n'.join(errores))
-            if (len(res['Carpetas']) + len(res['Claves'])) > len(errores):
-                preguntar_reinicio('exclusiones por programa')
+                messagebox.showwarning('UWF Aulas', 'Encolado con avisos:\n\n' + '\n'.join(errores))
+            lbl_barra.config(text='%d exclusiones encoladas como pendientes' % nuevos)
         except Exception as ex:
             messagebox.showerror('Error', str(ex))
 
     def on_add_carpeta():
-        """Boton 'Carpeta': elige una carpeta y la anade como exclusion."""
+        """Boton 'Carpeta': elige una carpeta y la encola como exclusion pendiente."""
         ruta = filedialog.askdirectory()
         if ruta:
-            try:
-                add_exclusion_archivo(ruta); refrescar(); preguntar_reinicio('nueva exclusion')
-            except Exception as ex:
-                messagebox.showerror('Error', str(ex))
+            _encolar_exclusion('archivo', os.path.normpath(ruta))
 
     def on_add_archivo():
-        """Boton 'Archivo': elige un archivo suelto y lo anade como exclusion."""
+        """Boton 'Archivo': elige un archivo suelto y lo encola como exclusion pendiente."""
         ruta = filedialog.askopenfilename()
         if ruta:
-            try:
-                add_exclusion_archivo(ruta); refrescar(); preguntar_reinicio('nueva exclusion')
-            except Exception as ex:
-                messagebox.showerror('Error', str(ex))
+            _encolar_exclusion('archivo', os.path.normpath(ruta))
 
     def on_add_reg():
-        """Boton 'Clave HKLM': pide una clave de registro y la anade como exclusion."""
+        """Boton 'Clave HKLM': pide una clave de registro y la encola como exclusion pendiente."""
         clave = simpledialog.askstring('UWF Aulas', 'Clave de registro a excluir (solo HKLM):',
                                        initialvalue='HKLM\\SOFTWARE\\', parent=form)
         if clave:
-            try:
-                add_exclusion_registro(clave); refrescar(); preguntar_reinicio('nueva exclusion')
-            except Exception as ex:
-                messagebox.showerror('Error', str(ex))
+            _encolar_exclusion('registro', clave)
 
     def on_quitar():
-        """Boton 'Quitar': elimina la exclusion seleccionada en la lista."""
+        """Boton 'Quitar': sobre una fila pendiente la saca de la cola; sobre una exclusion ya
+        activa en UWF encola su retirada. En ningun caso toca el equipo todavia."""
         sel = lv.selection()
         if not sel:
             return
-        tipo, val, _ = lv.item(sel[0])['values']
+        valores = lv.item(sel[0])['values']
+        estado_fila, tipo_txt, valor = str(valores[0]), str(valores[1]), str(valores[2])
+        tipo = 'archivo' if tipo_txt == 'Archivo' else 'registro'
         try:
-            if tipo == 'Archivo':
-                remove_exclusion_archivo(val)
+            p = leer_pendientes()
+            if estado_fila.startswith('PENDIENTE'):
+                quitar_pendiente_exclusion(p, tipo, valor)
+                escribir_log('CancelarPendiente', 'OK', '%s %s' % (tipo, valor))
+                lbl_barra.config(text='Pendiente cancelado')
             else:
-                remove_exclusion_registro(val)
+                anadir_pendiente_exclusion(p, tipo, 'remove', valor)
+                escribir_log('EncolarExclusion', 'OK', 'remove %s %s' % (tipo, valor))
+                lbl_barra.config(text='Retirada encolada como pendiente')
+            guardar_pendientes(p)
             refrescar()
-            preguntar_reinicio('exclusion eliminada')
         except Exception as ex:
             messagebox.showerror('Error', str(ex))
 
-    def on_importar():
-        """Boton 'Importar perfil': carga un perfil JSON, lo guarda como el activo y lo aplica."""
-        ruta = filedialog.askopenfilename(filetypes=[('Perfil JSON', '*.json')])
-        if ruta:
-            try:
-                with open(ruta, 'r', encoding='utf-8-sig') as fh:
-                    p = json.load(fh)
-                guardar_perfil(p)
-                form.config(cursor='watch'); form.update_idletasks()
-                u = get_estado_uwf()
-                errores = aplicar_perfil(p, u['FiltroActual'])
-                form.config(cursor='')
+    def on_aplicar_pendientes():
+        """Boton 'Aplicar cambios y reiniciar': el unico punto donde la cola llega a UWF."""
+        p = leer_pendientes()
+        if pendientes_vacios(p):
+            return
+        u = get_estado_uwf()
+        if not u['Instalado']:
+            messagebox.showwarning('UWF Aulas',
+                'UWF no esta instalado en este equipo, asi que los cambios no pueden aplicarse '
+                'todavia. Instalalo desde la pestana Estado: la cola de pendientes se conserva.')
+            return
+
+        requiere_off = u['FiltroActual'] and disco_pendiente_exige_filtro_off(p, u)
+        detalle = '\n'.join('  - ' + l for l in resumen_pendientes(p))
+        aviso = 'Se van a aplicar estos cambios:\n\n%s\n\n' % detalle
+        if requiere_off:
+            aviso += ('Cambiar el tamano o el sitio exige desactivar la proteccion, asi que el equipo se\n'
+                      'reiniciara DOS veces: la primera para aplicarlo sin proteccion y la segunda para\n'
+                      'volver a protegerlo. No hay que hacer nada entre medias.\n\nContinuar?')
+        else:
+            aviso += 'El equipo se reiniciara una vez para que surtan efecto.\n\nContinuar?'
+        if not messagebox.askyesno('UWF Aulas', aviso):
+            return
+
+        try:
+            form.config(cursor='watch'); form.update_idletasks()
+            res = aplicar_pendientes(u['FiltroActual'])
+            form.config(cursor='')
+            refrescar()
+            if res['Errores']:
+                messagebox.showwarning('UWF Aulas', 'Aplicado con avisos:\n\n' + '\n'.join(res['Errores']))
+            if requiere_off and res['EsperandoFiltroOff']:
+                iniciar_aplicacion_pendientes()
                 refrescar()
-                msg = "Perfil '%s' aplicado." % p.get('nombre', '')
-                if errores:
-                    msg += '\n\nAvisos:\n' + '\n'.join(errores)
-                messagebox.showinfo('UWF Aulas', msg)
-                preguntar_reinicio('perfil de exclusiones aplicado')
-            except Exception as ex:
-                form.config(cursor='')
-                messagebox.showerror('Error', str(ex))
+                reiniciar_equipo('aplicar cambios pendientes sin proteccion')
+            elif res['Aplicados']:
+                preguntar_reinicio('cambios pendientes aplicados')
+        except Exception as ex:
+            form.config(cursor='')
+            messagebox.showerror('Error', str(ex))
+
+    def on_descartar_pendientes():
+        """Boton 'Descartar': vacia la cola sin tocar el equipo."""
+        p = leer_pendientes()
+        if pendientes_vacios(p):
+            return
+        if not messagebox.askyesno('UWF Aulas',
+                'Se descartaran los %d cambios pendientes sin aplicarlos.\n\n'
+                'El equipo se queda exactamente como esta. Continuar?' % len(resumen_pendientes(p))):
+            return
+        guardar_pendientes({'exclusiones': [], 'disco': None})
+        escribir_log('DescartarPendientes', 'OK')
+        refrescar()
+        lbl_barra.config(text='Cambios pendientes descartados')
+
+    def on_importar():
+        """Boton 'Importar perfil': carga un perfil JSON, lo guarda como el activo y encola todo
+        su contenido como cambios pendientes para que el tecnico lo revise antes de aplicarlo."""
+        ruta = filedialog.askopenfilename(filetypes=[('Perfil JSON', '*.json')])
+        if not ruta:
+            return
+        try:
+            with open(ruta, 'r', encoding='utf-8-sig') as fh:
+                perfil = json.load(fh)
+            guardar_perfil(perfil)          # valida los umbrales y rechaza el perfil si no cuadran
+            p = leer_pendientes()
+            nuevos = 0
+            errores = []
+            for tipo, clave in (('archivo', 'archivos'), ('registro', 'registro')):
+                for v in (perfil.get(clave) or []):
+                    try:
+                        if anadir_pendiente_exclusion(p, tipo, 'add', v):
+                            nuevos += 1
+                    except Exception as ex:
+                        errores.append('%s -> %s' % (v, ex))
+            ov = perfil.get('overlay') or {}
+            if ov:
+                try:
+                    fijar_pendiente_disco(p, 'RAM' if ov.get('tipo') == 'RAM' else 'Disco',
+                                          ov.get('tamanoMB'), ov.get('avisoMB'), ov.get('criticoMB'))
+                    nuevos += 1
+                except Exception as ex:
+                    errores.append('uso del disco -> %s' % ex)
+            guardar_pendientes(p)
+            escribir_log('ImportarPerfil', 'OK',
+                         "%s: %d cambios encolados" % (perfil.get('nombre', ''), nuevos))
+            refrescar()
+            msg = ("Perfil '%s' cargado.\n\n%d cambios encolados como pendientes: revisalos y pulsa "
+                   '"Aplicar cambios y reiniciar".' % (perfil.get('nombre', ''), nuevos))
+            if errores:
+                msg += '\n\nAvisos:\n' + '\n'.join(errores)
+            messagebox.showinfo('UWF Aulas', msg)
+        except Exception as ex:
+            messagebox.showerror('Error', str(ex))
 
     def on_exportar():
         """Boton 'Exportar perfil': vuelca las exclusiones y el overlay actuales a un JSON."""
@@ -1360,17 +1843,16 @@ def mostrar_interfaz():
                 messagebox.showerror('Error', str(ex))
 
     def on_aplicar_ov():
-        """Boton 'Aplicar configuracion del overlay' de la pestana Overlay."""
+        """Boton 'Anadir a los cambios pendientes' de la pestana Uso del disco."""
         try:
-            u = get_estado_uwf()
             tipo = 'RAM' if var_tipo.get() == 'RAM' else 'Disco'
-            errores = aplicar_overlay(tipo, int(num_tam.get()), int(num_av.get()),
-                                      int(num_cr.get()), u['FiltroActual'])
+            p = leer_pendientes()
+            fijar_pendiente_disco(p, tipo, int(num_tam.get()), int(num_av.get()), int(num_cr.get()))
+            guardar_pendientes(p)
+            escribir_log('EncolarUsoDisco', 'OK', 'tipo=%s tamano=%s aviso=%s critico=%s'
+                         % (tipo, num_tam.get(), num_av.get(), num_cr.get()))
             refrescar()
-            if errores:
-                messagebox.showwarning('UWF Aulas', '\n\n'.join(errores))
-            else:
-                preguntar_reinicio('configuracion del overlay')
+            lbl_barra.config(text='Uso del disco encolado como pendiente')
         except Exception as ex:
             messagebox.showerror('Error', str(ex))
 
@@ -1419,6 +1901,8 @@ def mostrar_interfaz():
     btn_importar.config(command=on_importar)
     btn_exportar.config(command=on_exportar)
     btn_aplicar_ov.config(command=on_aplicar_ov)
+    btn_aplicar_pend.config(command=on_aplicar_pendientes)
+    btn_descartar_pend.config(command=on_descartar_pendientes)
     btn_iniciar_m.config(command=on_iniciar_m)
     btn_finalizar_m.config(command=on_finalizar_m)
     btn_guardar_cfg.config(command=on_guardar_cfg)
@@ -1430,7 +1914,7 @@ def mostrar_interfaz():
     _set_spin(num_horas, int(cfg['horasMaxMantenimiento']) if cfg.get('horasMaxMantenimiento') else 8)
 
     estado_actual = leer_estado()
-    if estado_actual and estado_actual.get('fase') == 'mantenimiento':
+    if estado_actual and estado_actual.get('fase') in ('mantenimiento', 'aplicando'):
         tabs.select(tab_mant)
 
     refrescar()

@@ -9,8 +9,18 @@
 #
 #  Cambios v2:
 #   - Corregidos los umbrales del overlay (aviso < critico) y validacion
-#   - Pestana Overlay: tipo (RAM/Disco), tamano y umbrales configurables
+#   - Pestana Uso del disco: tipo (RAM/Disco), tamano y umbrales configurables
 #   - Exclusiones por programa: detecta lo instalado y propone carpetas/claves
+#
+#  Cambios v3:
+#   - Cola de cambios pendientes (pendientes.json): la GUI encola exclusiones y uso
+#     del disco, y nada llega a UWF hasta pulsar "Aplicar cambios y reiniciar". La
+#     lista se ve aunque UWF no este disponible en el equipo.
+#   - Fase 'aplicando': si un pendiente exige el filtro desactivado (tipo o tamano),
+#     la herramienta abre la ventana de mantenimiento sola y el vigilante la cierra
+#     tras aplicar la cola, volviendo a proteger el equipo.
+#   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
+#     claves de los perfiles JSON) se conserva el termino de UWF.
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -19,6 +29,7 @@ $script:Base       = Join-Path $env:ProgramData 'UWF-Aulas'
 $script:CfgPath    = Join-Path $script:Base 'config.json'
 $script:EstadoPath = Join-Path $script:Base 'estado.json'
 $script:PerfilPath = Join-Path $script:Base 'perfil-exclusiones.json'
+$script:PendPath   = Join-Path $script:Base 'pendientes.json'
 $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
@@ -216,6 +227,28 @@ function Test-UmbralesValidos([int]$aviso, [int]$critico, [int]$tamano) {
     return ($aviso -gt 0 -and $critico -gt $aviso -and $tamano -ge $critico)
 }
 
+function Aplicar-TipoTamano([string]$Tipo, [int]$TamanoMB) {
+    # UWF solo admite cambiar tipo y tamano con el filtro DESACTIVADO: comprobarlo es
+    # responsabilidad de quien llama.
+    $errores = New-Object System.Collections.ArrayList
+    $t = if ($Tipo -eq 'Disco') { 'disk' } else { 'ram' }
+    $r1 = Invoke-Uwf @('overlay','set-type',$t)
+    if (-not $r1.Ok) { [void]$errores.Add("set-type: $($r1.Salida)") }
+    $r2 = Invoke-Uwf @('overlay','set-size',"$TamanoMB")
+    if (-not $r2.Ok) { [void]$errores.Add("set-size: $($r2.Salida)") }
+    return $errores
+}
+
+function Aplicar-Umbrales([int]$AvisoMB, [int]$CriticoMB) {
+    # Los umbrales se pueden cambiar en cualquier momento, con el filtro activo o no.
+    $errores = New-Object System.Collections.ArrayList
+    $r1 = Invoke-Uwf @('overlay','set-warningthreshold',"$AvisoMB")
+    if (-not $r1.Ok) { [void]$errores.Add("set-warningthreshold: $($r1.Salida)") }
+    $r2 = Invoke-Uwf @('overlay','set-criticalthreshold',"$CriticoMB")
+    if (-not $r2.Ok) { [void]$errores.Add("set-criticalthreshold: $($r2.Salida)") }
+    return $errores
+}
+
 function Aplicar-Overlay {
     param([string]$Tipo, [int]$TamanoMB, [int]$AvisoMB, [int]$CriticoMB, [bool]$FiltroActivo)
 
@@ -227,19 +260,12 @@ function Aplicar-Overlay {
 
     # Tipo y tamano solo se pueden cambiar con el filtro desactivado
     if ($FiltroActivo) {
-        [void]$errores.Add('El tipo y el tamano del overlay solo se pueden cambiar con la proteccion desactivada. Hazlo durante una ventana de mantenimiento. Los umbrales si se han aplicado.')
+        [void]$errores.Add('El tamano y el sitio del uso del disco solo se pueden cambiar con la proteccion desactivada. Hazlo durante una ventana de mantenimiento. Los umbrales si se han aplicado.')
     } else {
-        $t = if ($Tipo -eq 'Disco') { 'disk' } else { 'ram' }
-        $r1 = Invoke-Uwf @('overlay','set-type',$t)
-        if (-not $r1.Ok) { [void]$errores.Add("set-type: $($r1.Salida)") }
-        $r2 = Invoke-Uwf @('overlay','set-size',"$TamanoMB")
-        if (-not $r2.Ok) { [void]$errores.Add("set-size: $($r2.Salida)") }
+        foreach ($e in @(Aplicar-TipoTamano $Tipo $TamanoMB)) { [void]$errores.Add($e) }
     }
 
-    $r3 = Invoke-Uwf @('overlay','set-warningthreshold',"$AvisoMB")
-    if (-not $r3.Ok) { [void]$errores.Add("set-warningthreshold: $($r3.Salida)") }
-    $r4 = Invoke-Uwf @('overlay','set-criticalthreshold',"$CriticoMB")
-    if (-not $r4.Ok) { [void]$errores.Add("set-criticalthreshold: $($r4.Salida)") }
+    foreach ($e in @(Aplicar-Umbrales $AvisoMB $CriticoMB)) { [void]$errores.Add($e) }
 
     Escribir-Log 'AplicarOverlay' $(if ($errores.Count -eq 0) {'OK'} else {'PARCIAL'}) `
         ("tipo=$Tipo tamano=$TamanoMB aviso=$AvisoMB critico=$CriticoMB")
@@ -314,6 +340,224 @@ function Remove-ExclusionRegistro([string]$clave) {
     $r = Invoke-Uwf @('registry','remove-exclusion',$c)
     Escribir-Log 'QuitarExclusionRegistro' $(if ($r.Ok) {'OK'} else {'ERROR'}) $c
     if (-not $r.Ok) { throw $r.Salida }
+}
+
+# -----------------------------------------------------------------------------
+#  Cambios pendientes
+#
+#  El tecnico encola en pendientes.json todo lo que quiere cambiar (exclusiones y uso
+#  del disco) y lo aplica de una vez con "Aplicar cambios y reiniciar". Dos razones:
+#  la GUI puede mostrar lo decidido aunque UWF no este disponible todavia en el equipo,
+#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola para
+#  aplicarse en el arranque siguiente.
+# -----------------------------------------------------------------------------
+function Nueva-ColaPendientes {
+    return [pscustomobject]@{
+        exclusiones = (New-Object System.Collections.ArrayList)
+        disco       = $null
+    }
+}
+
+function Test-PendientesVacios($p) {
+    return (($p.exclusiones.Count -eq 0) -and (-not $p.disco))
+}
+
+function Leer-Pendientes {
+    # Descarta entradas corruptas en vez de fallar: la cola no debe poder dejar la GUI inservible.
+    $p = Nueva-ColaPendientes
+    if (Test-Path -LiteralPath $script:PendPath) {
+        try {
+            $guardado = Get-Content -LiteralPath $script:PendPath -Raw | ConvertFrom-Json
+            foreach ($e in @($guardado.exclusiones)) {
+                if (-not $e) { continue }
+                if ((@('archivo','registro') -contains $e.tipo) -and
+                    (@('add','remove') -contains $e.accion) -and $e.valor) {
+                    [void]$p.exclusiones.Add([pscustomobject]@{
+                        tipo   = [string]$e.tipo
+                        accion = [string]$e.accion
+                        valor  = [string]$e.valor
+                    })
+                }
+            }
+            $d = $guardado.disco
+            if ($d -and (@('RAM','Disco') -contains $d.tipo) -and
+                (Test-UmbralesValidos ([int]$d.avisoMB) ([int]$d.criticoMB) ([int]$d.tamanoMB))) {
+                $p.disco = [pscustomobject]@{
+                    tipo      = [string]$d.tipo
+                    tamanoMB  = [int]$d.tamanoMB
+                    avisoMB   = [int]$d.avisoMB
+                    criticoMB = [int]$d.criticoMB
+                }
+            }
+        } catch { }
+    }
+    return $p
+}
+
+function Guardar-Pendientes($p) {
+    Inicializar-Carpeta
+    if (Test-PendientesVacios $p) {
+        Remove-Item -LiteralPath $script:PendPath -Force -ErrorAction SilentlyContinue
+        return
+    }
+    [pscustomobject]@{
+        version     = 1
+        actualizado = (Get-Date).ToString('s')
+        tecnico     = $env:USERNAME
+        equipo      = $env:COMPUTERNAME
+        exclusiones = @($p.exclusiones)
+        disco       = $p.disco
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:PendPath -Encoding UTF8
+}
+
+function Valor-Pendiente([string]$Tipo, [string]$Valor) {
+    # Forma canonica con la que se compara y se guarda un valor encolado
+    if ($Tipo -eq 'registro') { return (Normalizar-ClaveRegistro $Valor) }
+    return $Valor.Trim().TrimEnd('\')
+}
+
+function Add-PendienteExclusion($p, [string]$Tipo, [string]$Accion, [string]$Valor) {
+    # Valida al encolar, no al aplicar, para que el tecnico vea el error en el momento en que
+    # lo decide. Si ya habia encolado el pendiente opuesto sobre el mismo valor, se anulan
+    # entre si: vuelve al estado que tiene el equipo ahora. Devuelve $true si la cola cambio.
+    $v = Valor-Pendiente $Tipo $Valor
+    if (-not $v) { throw 'Ruta o clave vacia.' }
+    if ($Accion -eq 'add') {
+        if ($Tipo -eq 'archivo' -and (Test-ExclusionPeligrosa $v)) {
+            throw "Ruta prohibida: excluirla rompe Windows Update ($v)"
+        }
+        if ($Tipo -eq 'registro' -and $v -notmatch '^HKLM\\') {
+            throw 'UWF solo admite exclusiones de registro bajo HKLM.'
+        }
+    }
+
+    foreach ($e in @($p.exclusiones)) {
+        if ($e.tipo -eq $Tipo -and (Valor-Pendiente $Tipo $e.valor) -eq $v) {
+            if ($e.accion -eq $Accion) { return $false }
+            [void]$p.exclusiones.Remove($e)
+            return $true
+        }
+    }
+
+    [void]$p.exclusiones.Add([pscustomobject]@{ tipo = $Tipo; accion = $Accion; valor = $v })
+    return $true
+}
+
+function Remove-PendienteExclusion($p, [string]$Tipo, [string]$Valor) {
+    $v = Valor-Pendiente $Tipo $Valor
+    $quitar = @($p.exclusiones | Where-Object { $_.tipo -eq $Tipo -and (Valor-Pendiente $Tipo $_.valor) -eq $v })
+    foreach ($e in $quitar) { [void]$p.exclusiones.Remove($e) }
+    return ($quitar.Count -gt 0)
+}
+
+function Set-PendienteDisco($p, [string]$Tipo, [int]$TamanoMB, [int]$AvisoMB, [int]$CriticoMB) {
+    if (@('RAM','Disco') -notcontains $Tipo) { throw "Tipo no valido: $Tipo" }
+    if (-not (Test-UmbralesValidos $AvisoMB $CriticoMB $TamanoMB)) {
+        throw "Umbrales no validos: debe cumplirse aviso < critico <= tamano (has puesto $AvisoMB / $CriticoMB / $TamanoMB MB)."
+    }
+    $p.disco = [pscustomobject]@{
+        tipo      = $Tipo
+        tamanoMB  = $TamanoMB
+        avisoMB   = $AvisoMB
+        criticoMB = $CriticoMB
+    }
+}
+
+function Test-DiscoPendienteExigeFiltroOff($p, $uwf) {
+    # True si el pendiente de disco cambia tipo o tamano, que UWF solo admite con el filtro
+    # desactivado. Si solo cambian los umbrales no hace falta ventana de mantenimiento.
+    if (-not $p.disco) { return $false }
+    if (-not $uwf.Instalado) { return $true }
+    return (($p.disco.tipo -ne $uwf.OverlayTipo) -or ([int]$p.disco.tamanoMB -ne [int]$uwf.OverlayMaxMB))
+}
+
+function Get-ResumenPendientes($p) {
+    $lineas = New-Object System.Collections.ArrayList
+    foreach ($e in @($p.exclusiones)) {
+        $verbo = if ($e.accion -eq 'add') { 'Anadir' } else { 'Quitar' }
+        $que   = if ($e.tipo -eq 'archivo') { 'carpeta/archivo' } else { 'clave de registro' }
+        [void]$lineas.Add("$verbo ${que}: $($e.valor)")
+    }
+    if ($p.disco) {
+        [void]$lineas.Add("Uso del disco: $($p.disco.tipo), $($p.disco.tamanoMB) MB (aviso $($p.disco.avisoMB), critico $($p.disco.criticoMB))")
+    }
+    return $lineas
+}
+
+function Aplicar-Pendientes([bool]$FiltroActivo) {
+    # Aplica todo lo encolado que se pueda aplicar ahora y conserva el resto en la cola.
+    # Exclusiones y umbrales se pueden registrar con el filtro activo o no (surten efecto tras
+    # reiniciar). El tipo y el tamano exigen el filtro desactivado: con la proteccion activa se
+    # quedan encolados para aplicarse en el arranque de mantenimiento.
+    $p = Leer-Pendientes
+    $res = [pscustomobject]@{
+        Aplicados          = (New-Object System.Collections.ArrayList)
+        Errores            = (New-Object System.Collections.ArrayList)
+        Restantes          = 0
+        EsperandoFiltroOff = $false
+    }
+    if (Test-PendientesVacios $p) { return $res }
+
+    $quedan = New-Object System.Collections.ArrayList
+    foreach ($e in @($p.exclusiones)) {
+        $etiqueta = "$(if ($e.accion -eq 'add') {'anadir'} else {'quitar'}) $($e.valor)"
+        try {
+            if ($e.tipo -eq 'archivo') {
+                if ($e.accion -eq 'add') { Add-ExclusionArchivo $e.valor } else { Remove-ExclusionArchivo $e.valor }
+            } else {
+                if ($e.accion -eq 'add') { Add-ExclusionRegistro $e.valor } else { Remove-ExclusionRegistro $e.valor }
+            }
+            [void]$res.Aplicados.Add($etiqueta)
+        } catch {
+            [void]$res.Errores.Add("$etiqueta -> $($_.Exception.Message)")
+            [void]$quedan.Add($e)
+        }
+    }
+
+    $discoQueda = $null
+    if ($p.disco) {
+        try {
+            $errU = @(Aplicar-Umbrales ([int]$p.disco.avisoMB) ([int]$p.disco.criticoMB))
+            if ($errU.Count -gt 0) {
+                foreach ($x in $errU) { [void]$res.Errores.Add($x) }
+            } else {
+                [void]$res.Aplicados.Add("umbrales $($p.disco.avisoMB) / $($p.disco.criticoMB) MB")
+            }
+
+            if ($FiltroActivo) {
+                # Tipo y tamano no se pueden tocar con la proteccion activa. Solo se quedan
+                # encolados si de verdad cambian algo: si ya coinciden, no hay nada que hacer.
+                if (Test-DiscoPendienteExigeFiltroOff $p (Get-EstadoUwf)) {
+                    $discoQueda = $p.disco
+                    $res.EsperandoFiltroOff = $true
+                } else {
+                    [void]$res.Aplicados.Add("uso del disco: ya estaba en $($p.disco.tipo), $($p.disco.tamanoMB) MB")
+                }
+            } else {
+                $errT = @(Aplicar-TipoTamano ([string]$p.disco.tipo) ([int]$p.disco.tamanoMB))
+                if ($errT.Count -gt 0) {
+                    foreach ($x in $errT) { [void]$res.Errores.Add($x) }
+                    $discoQueda = $p.disco
+                } else {
+                    [void]$res.Aplicados.Add("uso del disco $($p.disco.tipo), $($p.disco.tamanoMB) MB")
+                }
+            }
+        } catch {
+            [void]$res.Errores.Add("uso del disco -> $($_.Exception.Message)")
+            $discoQueda = $p.disco
+        }
+    }
+
+    $cola = Nueva-ColaPendientes
+    foreach ($e in $quedan) { [void]$cola.exclusiones.Add($e) }
+    $cola.disco = $discoQueda
+    Guardar-Pendientes $cola
+
+    $res.Restantes = $quedan.Count + $(if ($discoQueda) { 1 } else { 0 })
+    Escribir-Log 'AplicarPendientes' `
+        $(if ($res.Errores.Count -eq 0 -and $res.Restantes -eq 0) {'OK'} else {'PARCIAL'}) `
+        ("aplicados=$($res.Aplicados.Count) restantes=$($res.Restantes) errores=$($res.Errores.Count)")
+    return $res
 }
 
 # -----------------------------------------------------------------------------
@@ -515,6 +759,17 @@ function Iniciar-Mantenimiento {
     Escribir-Log 'IniciarMantenimiento' 'OK' 'filtro desactivado, pendiente de reinicio'
 }
 
+function Iniciar-AplicacionPendientes {
+    # Abre una ventana de mantenimiento automatica, solo para aplicar los pendientes que exigen
+    # el filtro desactivado (tipo y tamano del uso del disco). Se distingue de un mantenimiento
+    # normal por la fase 'aplicando': el vigilante la reconoce en el arranque siguiente, aplica
+    # la cola, vuelve a proteger el equipo y reinicia sin que el tecnico haga nada mas.
+    $r = Invoke-Uwf @('filter','disable')
+    if (-not $r.Ok) { throw "No se ha podido desactivar el filtro: $($r.Salida)" }
+    Guardar-Estado 'aplicando'
+    Escribir-Log 'IniciarAplicacionPendientes' 'OK' 'filtro desactivado para aplicar la cola, pendiente de reinicio'
+}
+
 function Finalizar-Mantenimiento {
     $r = Invoke-Uwf @('filter','enable')
     if (-not $r.Ok) { throw "No se ha podido activar el filtro: $($r.Salida)" }
@@ -543,6 +798,33 @@ function Ejecutar-Vigilante {
     }
 
     switch ($estado.fase) {
+        'aplicando' {
+            # El equipo ha arrancado sin proteccion solo para volcar la cola. Pase lo que pase con
+            # los pendientes, el filtro tiene que quedar activo otra vez antes de devolver el
+            # equipo al aula.
+            if ($uwf.FiltroActual) {
+                Escribir-Log 'Vigilante' 'ERROR' 'Se esperaba el filtro desactivado para aplicar la cola; se deja para el tecnico'
+                Guardar-Estado 'verificando'
+                return
+            }
+            try {
+                $res = Aplicar-Pendientes $false
+                Escribir-Log 'Vigilante' `
+                    $(if ($res.Errores.Count -eq 0 -and $res.Restantes -eq 0) {'OK'} else {'PARCIAL'}) `
+                    ("Cola aplicada: $($res.Aplicados.Count) cambios, $($res.Restantes) restantes, $($res.Errores.Count) errores")
+                foreach ($err in $res.Errores) { Escribir-Log 'Vigilante' 'ERROR' $err }
+            } catch {
+                Escribir-Log 'Vigilante' 'ERROR' ("Al aplicar la cola: " + $_.Exception.Message)
+            }
+            try {
+                $r = Invoke-Uwf @('filter','enable')
+                if (-not $r.Ok) { Escribir-Log 'Vigilante' 'ERROR' "No se ha podido reactivar el filtro: $($r.Salida)" }
+                Guardar-Estado 'verificando'
+                Reiniciar-Equipo 'cierre automatico tras aplicar los cambios pendientes'
+            } catch {
+                Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message
+            }
+        }
         'verificando' {
             if ($uwf.FiltroActual) {
                 Escribir-Log 'Vigilante' 'OK' 'Mantenimiento cerrado, filtro activo y verificado'
@@ -553,6 +835,20 @@ function Ejecutar-Vigilante {
             }
         }
         'mantenimiento' {
+            # Arranque de mantenimiento: se aprovecha que no hay proteccion para volcar la cola.
+            # Aqui no se reinicia, porque el tecnico esta trabajando en el equipo.
+            if (-not $uwf.FiltroActual -and -not (Test-PendientesVacios (Leer-Pendientes))) {
+                try {
+                    $res = Aplicar-Pendientes $false
+                    Escribir-Log 'Vigilante' `
+                        $(if ($res.Errores.Count -eq 0 -and $res.Restantes -eq 0) {'OK'} else {'PARCIAL'}) `
+                        ("Cola aplicada en mantenimiento: $($res.Aplicados.Count) cambios, $($res.Restantes) restantes, $($res.Errores.Count) errores")
+                    foreach ($err in $res.Errores) { Escribir-Log 'Vigilante' 'ERROR' $err }
+                } catch {
+                    Escribir-Log 'Vigilante' 'ERROR' ("Al aplicar la cola en mantenimiento: " + $_.Exception.Message)
+                }
+            }
+
             $horas = ((Get-Date) - [datetime]$estado.inicio).TotalHours
             $max   = 8
             if ($cfg.horasMaxMantenimiento) { $max = [double]$cfg.horasMaxMantenimiento }
@@ -701,7 +997,7 @@ function Mostrar-Interfaz {
 
     $tabEstado  = New-Object System.Windows.Forms.TabPage; $tabEstado.Text  = 'Estado'
     $tabExcl    = New-Object System.Windows.Forms.TabPage; $tabExcl.Text    = 'Exclusiones'
-    $tabOverlay = New-Object System.Windows.Forms.TabPage; $tabOverlay.Text = 'Overlay'
+    $tabOverlay = New-Object System.Windows.Forms.TabPage; $tabOverlay.Text = 'Uso del disco'
     $tabMant    = New-Object System.Windows.Forms.TabPage; $tabMant.Text    = 'Mantenimiento'
     $tabCfg     = New-Object System.Windows.Forms.TabPage; $tabCfg.Text     = 'Configuracion'
     $tabs.TabPages.AddRange(@($tabEstado, $tabExcl, $tabOverlay, $tabMant, $tabCfg))
@@ -713,6 +1009,41 @@ function Mostrar-Interfaz {
     $lblBarra.Text      = 'Listo'
     [void]$barra.Items.Add($lblBarra)
     $form.Controls.Add($barra)
+
+    # ---- Barra de cambios pendientes (visible desde cualquier pestana) ----
+    # Es el unico punto donde se aplica algo: el resto de la ventana solo encola.
+    $barraPend          = New-Object System.Windows.Forms.Panel
+    $barraPend.Dock     = 'Bottom'
+    $barraPend.Height   = 56
+    $barraPend.BorderStyle = 'FixedSingle'
+
+    $lblPend            = New-Object System.Windows.Forms.Label
+    $lblPend.Location   = New-Object System.Drawing.Point(12, 8)
+    $lblPend.Size       = New-Object System.Drawing.Size(560, 40)
+    $lblPend.Font       = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $lblPend.Anchor     = 'Top,Left,Right'
+
+    $btnAplicarPend          = New-Object System.Windows.Forms.Button
+    $btnAplicarPend.Text     = 'Aplicar cambios y reiniciar'
+    $btnAplicarPend.Location = New-Object System.Drawing.Point(588, 11)
+    $btnAplicarPend.Size     = New-Object System.Drawing.Size(200, 34)
+    $btnAplicarPend.Anchor   = 'Top,Right'
+    $btnAplicarPend.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+    $btnDescartarPend          = New-Object System.Windows.Forms.Button
+    $btnDescartarPend.Text     = 'Descartar'
+    $btnDescartarPend.Location = New-Object System.Drawing.Point(798, 11)
+    $btnDescartarPend.Size     = New-Object System.Drawing.Size(110, 34)
+    $btnDescartarPend.Anchor   = 'Top,Right'
+
+    $barraPend.Controls.AddRange(@($lblPend, $btnAplicarPend, $btnDescartarPend))
+    $form.Controls.Add($barraPend)
+
+    # El orden de acoplado va del final de la coleccion al principio: la barra de estado
+    # tiene que acoplarse primera para quedar en el borde inferior, y las pestanas ultimas
+    # para quedarse con el espacio restante.
+    $barra.SendToBack()
+    $tabs.BringToFront()
 
     # =========================== PESTANA ESTADO ==============================
     $txtEstado                = New-Object System.Windows.Forms.TextBox
@@ -757,9 +1088,10 @@ function Mostrar-Interfaz {
     $lv.Location     = New-Object System.Drawing.Point(16, 16)
     $lv.Size         = New-Object System.Drawing.Size(880, 380)
     $lv.Anchor       = 'Top,Left,Right,Bottom'
-    [void]$lv.Columns.Add('Tipo', 90)
-    [void]$lv.Columns.Add('Ruta o clave', 610)
-    [void]$lv.Columns.Add('Existe', 160)
+    [void]$lv.Columns.Add('Estado', 150)
+    [void]$lv.Columns.Add('Tipo', 80)
+    [void]$lv.Columns.Add('Ruta o clave', 500)
+    [void]$lv.Columns.Add('Existe', 140)
     $tabExcl.Controls.Add($lv)
 
     $y2 = 408
@@ -807,7 +1139,7 @@ function Mostrar-Interfaz {
     $btnExportar.Anchor = 'Bottom,Left'
 
     $lblAviso = New-Object System.Windows.Forms.Label
-    $lblAviso.Text = 'Las exclusiones solo surten efecto tras reiniciar. Todo lo excluido se guarda de verdad en el disco: excluye lo minimo.'
+    $lblAviso.Text = 'Los cambios se quedan en la lista como PENDIENTES hasta que pulses "Aplicar cambios y reiniciar" abajo. Todo lo excluido se guarda de verdad en el disco: excluye lo minimo.'
     $lblAviso.Location = New-Object System.Drawing.Point(16, 448)
     $lblAviso.Size = New-Object System.Drawing.Size(880, 34)
     $lblAviso.Anchor = 'Bottom,Left,Right'
@@ -815,19 +1147,22 @@ function Mostrar-Interfaz {
 
     $tabExcl.Controls.AddRange(@($btnAddPrograma, $btnAddCarpeta, $btnAddArchivo, $btnAddReg, $btnQuitar, $btnImportar, $btnExportar, $lblAviso))
 
-    # =========================== PESTANA OVERLAY =============================
+    # ======================== PESTANA USO DEL DISCO ==========================
     $lblOv1          = New-Object System.Windows.Forms.Label
     $lblOv1.Text     = @"
-El overlay es el espacio donde se guardan los cambios temporales de cada sesion. Se vacia al reiniciar.
+Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al
+disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide
+cuanto espacio se reserva para eso y donde.
 
 - Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.
 - RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.
 
-El tipo y el tamano solo se pueden cambiar con la proteccion DESACTIVADA (durante un mantenimiento).
-Los umbrales de aviso y critico se pueden cambiar en cualquier momento.
+Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y
+el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se
+abrira la ventana de mantenimiento sola al aplicar.
 "@
     $lblOv1.Location = New-Object System.Drawing.Point(16, 16)
-    $lblOv1.Size     = New-Object System.Drawing.Size(880, 150)
+    $lblOv1.Size     = New-Object System.Drawing.Size(880, 160)
     $lblOv1.Anchor   = 'Top,Left,Right'
 
     $gbTipo          = New-Object System.Windows.Forms.GroupBox
@@ -898,9 +1233,10 @@ Los umbrales de aviso y critico se pueden cambiar en cualquier momento.
     $gbTam.Controls.AddRange(@($lblTam, $numTam, $lblAv, $numAv, $lblCr, $numCr, $lblRegla))
 
     $btnAplicarOv          = New-Object System.Windows.Forms.Button
-    $btnAplicarOv.Text     = 'Aplicar configuracion del overlay'
+    $btnAplicarOv.Text     = 'Anadir a los cambios pendientes'
     $btnAplicarOv.Location = New-Object System.Drawing.Point(16, 284)
     $btnAplicarOv.Size     = New-Object System.Drawing.Size(280, 40)
+    $btnAplicarOv.Font     = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
 
     $lblOvEstado          = New-Object System.Windows.Forms.Label
     $lblOvEstado.Location = New-Object System.Drawing.Point(16, 340)
@@ -992,6 +1328,8 @@ la proteccion por su cuenta en el siguiente arranque.
         try {
             $u  = Get-EstadoUwf
             $es = Leer-Estado
+            $pend = Leer-Pendientes
+            $lineasPend = @(Get-ResumenPendientes $pend)
 
             $sb = New-Object System.Text.StringBuilder
             [void]$sb.AppendLine("Equipo              : $env:COMPUTERNAME")
@@ -999,10 +1337,10 @@ la proteccion por su cuenta en el siguiente arranque.
             [void]$sb.AppendLine("Filtro (sesion act.): " + $(if ($u.FiltroActual) {'ACTIVO'} else {'DESACTIVADO'}))
             [void]$sb.AppendLine("Filtro (tras reinic): " + $(if ($u.FiltroSiguiente) {'ACTIVO'} else {'DESACTIVADO'}))
             [void]$sb.AppendLine("Volumenes protegidos: " + $(if ($u.VolumenesActual.Count) { $u.VolumenesActual -join ', ' } else {'ninguno'}))
-            [void]$sb.AppendLine("Overlay             : $($u.OverlayTipo), maximo $($u.OverlayMaxMB) MB")
+            [void]$sb.AppendLine("Uso del disco       : $($u.OverlayTipo), maximo $($u.OverlayMaxMB) MB")
             [void]$sb.AppendLine("Umbrales            : aviso $($u.OverlayAvisoMB) MB, critico $($u.OverlayCriticoMB) MB")
             if ($u.OverlayUsoMB -ge 0) {
-                [void]$sb.AppendLine("Consumo del overlay : $($u.OverlayUsoMB) MB")
+                [void]$sb.AppendLine("Espacio consumido   : $($u.OverlayUsoMB) MB")
             }
             [void]$sb.AppendLine('')
             if ($es) {
@@ -1010,6 +1348,7 @@ la proteccion por su cuenta en el siguiente arranque.
             } else {
                 [void]$sb.AppendLine('Mantenimiento       : ninguno en curso')
             }
+            [void]$sb.AppendLine("Cambios pendientes  : " + $(if ($lineasPend.Count) { "$($lineasPend.Count) sin aplicar" } else {'ninguno'}))
             if ($u.Error) { [void]$sb.AppendLine(''); [void]$sb.AppendLine("Aviso: $($u.Error)") }
             $txtEstado.Text = $sb.ToString()
 
@@ -1019,9 +1358,14 @@ la proteccion por su cuenta en el siguiente arranque.
             }
 
             # Banner
-            if ($es -and $es.fase -eq 'mantenimiento' -and -not $u.FiltroActual) {
+            $faseAbierta = if ($es) { $es.fase } else { $null }
+            if ((@('mantenimiento','aplicando') -contains $faseAbierta) -and -not $u.FiltroActual) {
                 $banner.BackColor  = [System.Drawing.Color]::FromArgb(178, 34, 34)
-                $lblBanner.Text    = 'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO'
+                $lblBanner.Text    = if ($faseAbierta -eq 'aplicando') {
+                    'APLICANDO CAMBIOS PENDIENTES  -  EL EQUIPO NO ESTA PROTEGIDO'
+                } else {
+                    'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO'
+                }
             } elseif ($u.FiltroActual) {
                 $banner.BackColor  = [System.Drawing.Color]::FromArgb(30, 120, 60)
                 $lblBanner.Text    = 'PROTECCION ACTIVA  -  los cambios se descartan al reiniciar'
@@ -1035,26 +1379,58 @@ la proteccion por su cuenta en el siguiente arranque.
             $btnFinalizarM.Enabled = ($u.Instalado -and -not $u.FiltroActual)
             $btnInstalar.Enabled   = (-not $u.Instalado)
 
-            # Pestana Overlay: reflejar estado actual y avisar si esta bloqueado
-            if ($u.Instalado) {
+            # Pestana Uso del disco: si hay algo encolado se muestran los valores pendientes
+            # (son los que el tecnico acaba de decidir); si no, el estado real del equipo.
+            if ($pend.disco) {
+                if ($pend.disco.tipo -eq 'RAM') { $radRam.Checked = $true } else { $radDisco.Checked = $true }
+                $numTam.Value = [Math]::Min([Math]::Max([int]$pend.disco.tamanoMB,  $numTam.Minimum), $numTam.Maximum)
+                $numAv.Value  = [Math]::Min([Math]::Max([int]$pend.disco.avisoMB,   $numAv.Minimum),  $numAv.Maximum)
+                $numCr.Value  = [Math]::Min([Math]::Max([int]$pend.disco.criticoMB, $numCr.Minimum),  $numCr.Maximum)
+                $lblOvEstado.Text = 'Estos valores estan PENDIENTES: todavia no son los del equipo. Pulsa "Aplicar cambios y reiniciar" abajo para que surtan efecto, o "Descartar" para volver a la configuracion real.'
+                $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(31, 95, 169)
+            } elseif ($u.Instalado) {
                 if ($u.OverlayTipo -eq 'RAM') { $radRam.Checked = $true } else { $radDisco.Checked = $true }
                 if ($u.OverlayMaxMB   -ge $numTam.Minimum) { $numTam.Value = [Math]::Min($u.OverlayMaxMB,   $numTam.Maximum) }
                 if ($u.OverlayAvisoMB -ge $numAv.Minimum)  { $numAv.Value  = [Math]::Min($u.OverlayAvisoMB, $numAv.Maximum) }
                 if ($u.OverlayCriticoMB -ge $numCr.Minimum){ $numCr.Value  = [Math]::Min($u.OverlayCriticoMB,$numCr.Maximum) }
                 if ($u.FiltroActual) {
-                    $lblOvEstado.Text = 'La proteccion esta ACTIVA: ahora mismo solo se pueden cambiar los umbrales. Para cambiar tipo o tamano, inicia antes un mantenimiento.'
+                    $lblOvEstado.Text = 'La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. Si los cambias, al aplicar se abrira la ventana de mantenimiento sola y el equipo se reiniciara dos veces.'
                     $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(150, 80, 0)
                 } else {
                     $lblOvEstado.Text = 'La proteccion esta desactivada: se puede cambiar todo. Los cambios se aplican tras reiniciar.'
                     $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(30, 120, 60)
                 }
+            } else {
+                $lblOvEstado.Text = 'UWF no esta instalado en este equipo: puedes dejar la configuracion preparada como pendiente, pero no se aplicara hasta instalar la caracteristica.'
+                $lblOvEstado.ForeColor = [System.Drawing.Color]::Gray
             }
 
-            # Exclusiones
+            # Exclusiones: primero la cola de pendientes, que se ve siempre aunque UWF no este
+            # disponible en este equipo; despues lo que ya esta activo en UWF.
             $lv.Items.Clear()
+            $encolados = New-Object System.Collections.ArrayList
+            foreach ($e in @($pend.exclusiones)) {
+                $esArchivo = ($e.tipo -eq 'archivo')
+                $it = New-Object System.Windows.Forms.ListViewItem(
+                    $(if ($e.accion -eq 'add') {'PENDIENTE: anadir'} else {'PENDIENTE: quitar'}))
+                [void]$it.SubItems.Add($(if ($esArchivo) {'Archivo'} else {'Registro'}))
+                [void]$it.SubItems.Add($e.valor)
+                $ruta = if ($esArchivo) { $e.valor } else { $e.valor -replace '^HKLM\\', 'HKLM:\' }
+                [void]$it.SubItems.Add($(if (Test-Path -LiteralPath $ruta) {'si'} else {'NO EXISTE - revisar'}))
+                $it.ForeColor = if ($e.accion -eq 'add') {
+                    [System.Drawing.Color]::FromArgb(31, 95, 169)
+                } else {
+                    [System.Drawing.Color]::FromArgb(178, 34, 34)
+                }
+                [void]$lv.Items.Add($it)
+                [void]$encolados.Add("$($e.tipo)|$(Valor-Pendiente $e.tipo $e.valor)")
+            }
+
             if ($u.Instalado) {
                 foreach ($a in (Get-ExclusionesArchivo)) {
-                    $it = New-Object System.Windows.Forms.ListViewItem('Archivo')
+                    if ($encolados -contains "archivo|$(Valor-Pendiente 'archivo' $a)") { continue }
+                    $it = New-Object System.Windows.Forms.ListViewItem('activa')
+                    [void]$it.SubItems.Add('Archivo')
                     [void]$it.SubItems.Add($a)
                     if (Test-Path -LiteralPath $a) {
                         [void]$it.SubItems.Add('si')
@@ -1065,7 +1441,9 @@ la proteccion por su cuenta en el siguiente arranque.
                     [void]$lv.Items.Add($it)
                 }
                 foreach ($k in (Get-ExclusionesRegistro)) {
-                    $it = New-Object System.Windows.Forms.ListViewItem('Registro')
+                    if ($encolados -contains "registro|$(Valor-Pendiente 'registro' $k)") { continue }
+                    $it = New-Object System.Windows.Forms.ListViewItem('activa')
+                    [void]$it.SubItems.Add('Registro')
                     [void]$it.SubItems.Add($k)
                     $ruta = $k -replace '^HKLM\\', 'HKLM:\'
                     if (Test-Path -LiteralPath $ruta) {
@@ -1076,6 +1454,22 @@ la proteccion por su cuenta en el siguiente arranque.
                     }
                     [void]$lv.Items.Add($it)
                 }
+            }
+
+            # Barra de cambios pendientes
+            if ($lineasPend.Count) {
+                $resumen = ($lineasPend | Select-Object -First 2) -join '  |  '
+                if ($lineasPend.Count -gt 2) { $resumen += "  |  y $($lineasPend.Count - 2) mas" }
+                $plural = if ($lineasPend.Count -eq 1) { '' } else { 's' }
+                $lblPend.Text = "$($lineasPend.Count) cambio$plural pendiente$plural de aplicar:`r`n$resumen"
+                $lblPend.ForeColor = [System.Drawing.Color]::FromArgb(31, 95, 169)
+                $btnAplicarPend.Enabled   = $true
+                $btnDescartarPend.Enabled = $true
+            } else {
+                $lblPend.Text = "Sin cambios pendientes.`r`nLo que configures en Exclusiones o en Uso del disco aparecera aqui antes de aplicarse."
+                $lblPend.ForeColor = [System.Drawing.Color]::Gray
+                $btnAplicarPend.Enabled   = $false
+                $btnDescartarPend.Enabled = $false
             }
 
             # Log
@@ -1135,25 +1529,43 @@ la proteccion por su cuenta en el siguiente arranque.
         }
     })
 
+    # Encola una exclusion y refresca la ventana. La validacion ocurre al encolar, asi que el
+    # tecnico ve el error en el momento en que lo decide y no al aplicar.
+    $encolarExclusion = {
+        param($Tipo, $Valor, $Accion = 'add')
+        try {
+            $p = Leer-Pendientes
+            [void](Add-PendienteExclusion $p $Tipo $Accion $Valor)
+            Guardar-Pendientes $p
+            Escribir-Log 'EncolarExclusion' 'OK' "$Accion $Tipo $Valor"
+            & $refrescar
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
+        }
+    }
+
     $btnAddPrograma.Add_Click({
         try {
             $res = Mostrar-DialogoPrograma $form
             if (-not $res.Aceptado) { return }
+            $p = Leer-Pendientes
+            $nuevos  = 0
             $errores = New-Object System.Collections.ArrayList
-            foreach ($c in $res.Carpetas) {
-                try { Add-ExclusionArchivo $c } catch { [void]$errores.Add("$c -> $($_.Exception.Message)") }
+            foreach ($par in @(@{ t = 'archivo'; v = $res.Carpetas }, @{ t = 'registro'; v = $res.Claves })) {
+                foreach ($v in @($par.v)) {
+                    try {
+                        if (Add-PendienteExclusion $p $par.t 'add' $v) { $nuevos++ }
+                    } catch { [void]$errores.Add("$v -> $($_.Exception.Message)") }
+                }
             }
-            foreach ($k in $res.Claves) {
-                try { Add-ExclusionRegistro $k } catch { [void]$errores.Add("$k -> $($_.Exception.Message)") }
-            }
+            Guardar-Pendientes $p
+            Escribir-Log 'EncolarExclusiones' 'OK' "por programa: $nuevos encoladas"
             & $refrescar
             if ($errores.Count) {
                 [System.Windows.Forms.MessageBox]::Show(
-                    "Anadido con avisos:`n`n" + ($errores -join "`n"), 'UWF Aulas', 'OK', 'Warning') | Out-Null
+                    "Encolado con avisos:`n`n" + ($errores -join "`n"), 'UWF Aulas', 'OK', 'Warning') | Out-Null
             }
-            if (($res.Carpetas.Count + $res.Claves.Count) -gt $errores.Count) {
-                & $preguntarReinicio 'exclusiones por programa'
-            }
+            $lblBarra.Text = "$nuevos exclusiones encoladas como pendientes"
         } catch {
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
         }
@@ -1161,61 +1573,139 @@ la proteccion por su cuenta en el siguiente arranque.
 
     $btnAddCarpeta.Add_Click({
         $d = New-Object System.Windows.Forms.FolderBrowserDialog
-        if ($d.ShowDialog() -eq 'OK') {
-            try { Add-ExclusionArchivo $d.SelectedPath; & $refrescar; & $preguntarReinicio 'nueva exclusion' }
-            catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
-        }
+        if ($d.ShowDialog() -eq 'OK') { & $encolarExclusion 'archivo' $d.SelectedPath 'add' }
     })
 
     $btnAddArchivo.Add_Click({
         $d = New-Object System.Windows.Forms.OpenFileDialog
-        if ($d.ShowDialog() -eq 'OK') {
-            try { Add-ExclusionArchivo $d.FileName; & $refrescar; & $preguntarReinicio 'nueva exclusion' }
-            catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
-        }
+        if ($d.ShowDialog() -eq 'OK') { & $encolarExclusion 'archivo' $d.FileName 'add' }
     })
 
     $btnAddReg.Add_Click({
         $clave = [Microsoft.VisualBasic.Interaction]::InputBox(
             'Clave de registro a excluir (solo HKLM):', 'UWF Aulas', 'HKLM\SOFTWARE\')
-        if ($clave) {
-            try { Add-ExclusionRegistro $clave; & $refrescar; & $preguntarReinicio 'nueva exclusion' }
-            catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
-        }
+        if ($clave) { & $encolarExclusion 'registro' $clave 'add' }
     })
 
     $btnQuitar.Add_Click({
+        # Sobre una fila pendiente la saca de la cola; sobre una exclusion ya activa en UWF
+        # encola su retirada. En ningun caso toca el equipo todavia.
         if ($lv.SelectedItems.Count -eq 0) { return }
-        $it   = $lv.SelectedItems[0]
-        $tipo = $it.SubItems[0].Text
-        $val  = $it.SubItems[1].Text
+        $it         = $lv.SelectedItems[0]
+        $estadoFila = $it.SubItems[0].Text
+        $tipoTxt    = $it.SubItems[1].Text
+        $val        = $it.SubItems[2].Text
+        $tipo       = if ($tipoTxt -eq 'Archivo') { 'archivo' } else { 'registro' }
         try {
-            if ($tipo -eq 'Archivo') { Remove-ExclusionArchivo $val } else { Remove-ExclusionRegistro $val }
+            $p = Leer-Pendientes
+            if ($estadoFila.StartsWith('PENDIENTE')) {
+                [void](Remove-PendienteExclusion $p $tipo $val)
+                Escribir-Log 'CancelarPendiente' 'OK' "$tipo $val"
+                $lblBarra.Text = 'Pendiente cancelado'
+            } else {
+                [void](Add-PendienteExclusion $p $tipo 'remove' $val)
+                Escribir-Log 'EncolarExclusion' 'OK' "remove $tipo $val"
+                $lblBarra.Text = 'Retirada encolada como pendiente'
+            }
+            Guardar-Pendientes $p
             & $refrescar
-            & $preguntarReinicio 'exclusion eliminada'
         } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
     })
 
+    $btnAplicarPend.Add_Click({
+        # Unico punto donde la cola llega a UWF
+        $p = Leer-Pendientes
+        if (Test-PendientesVacios $p) { return }
+        $u = Get-EstadoUwf
+        if (-not $u.Instalado) {
+            [System.Windows.Forms.MessageBox]::Show(
+                'UWF no esta instalado en este equipo, asi que los cambios no pueden aplicarse todavia. Instalalo desde la pestana Estado: la cola de pendientes se conserva.',
+                'UWF Aulas', 'OK', 'Warning') | Out-Null
+            return
+        }
+
+        $requiereOff = ($u.FiltroActual -and (Test-DiscoPendienteExigeFiltroOff $p $u))
+        $detalle = (@(Get-ResumenPendientes $p) | ForEach-Object { "  - $_" }) -join "`n"
+        $aviso = "Se van a aplicar estos cambios:`n`n$detalle`n`n"
+        if ($requiereOff) {
+            $aviso += "Cambiar el tamano o el sitio exige desactivar la proteccion, asi que el equipo se`nreiniciara DOS veces: la primera para aplicarlo sin proteccion y la segunda para`nvolver a protegerlo. No hay que hacer nada entre medias.`n`nContinuar?"
+        } else {
+            $aviso += "El equipo se reiniciara una vez para que surtan efecto.`n`nContinuar?"
+        }
+        if ([System.Windows.Forms.MessageBox]::Show($aviso, 'UWF Aulas', 'YesNo', 'Warning') -ne 'Yes') { return }
+
+        try {
+            $form.Cursor = 'WaitCursor'
+            $res = Aplicar-Pendientes $u.FiltroActual
+            $form.Cursor = 'Default'
+            & $refrescar
+            if ($res.Errores.Count) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "Aplicado con avisos:`n`n" + ($res.Errores -join "`n"), 'UWF Aulas', 'OK', 'Warning') | Out-Null
+            }
+            if ($requiereOff -and $res.EsperandoFiltroOff) {
+                Iniciar-AplicacionPendientes
+                & $refrescar
+                Reiniciar-Equipo 'aplicar cambios pendientes sin proteccion'
+            } elseif ($res.Aplicados.Count) {
+                & $preguntarReinicio 'cambios pendientes aplicados'
+            }
+        } catch {
+            $form.Cursor = 'Default'
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
+        }
+    })
+
+    $btnDescartarPend.Add_Click({
+        $p = Leer-Pendientes
+        if (Test-PendientesVacios $p) { return }
+        $n = @(Get-ResumenPendientes $p).Count
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Se descartaran los $n cambios pendientes sin aplicarlos.`n`nEl equipo se queda exactamente como esta. Continuar?",
+            'UWF Aulas', 'YesNo', 'Warning')
+        if ($r -ne 'Yes') { return }
+        Guardar-Pendientes (Nueva-ColaPendientes)
+        Escribir-Log 'DescartarPendientes' 'OK'
+        & $refrescar
+        $lblBarra.Text = 'Cambios pendientes descartados'
+    })
+
     $btnImportar.Add_Click({
+        # Carga un perfil JSON, lo guarda como el activo y encola todo su contenido como cambios
+        # pendientes para que el tecnico lo revise antes de aplicarlo.
         $d = New-Object System.Windows.Forms.OpenFileDialog
         $d.Filter = 'Perfil JSON|*.json'
-        if ($d.ShowDialog() -eq 'OK') {
-            try {
-                $p = Get-Content -LiteralPath $d.FileName -Raw | ConvertFrom-Json
-                Guardar-Perfil $p
-                $form.Cursor = 'WaitCursor'
-                $u = Get-EstadoUwf
-                $errores = Aplicar-Perfil $p $u.FiltroActual
-                $form.Cursor = 'Default'
-                & $refrescar
-                $msg = "Perfil '$($p.nombre)' aplicado."
-                if ($errores.Count) { $msg += "`n`nAvisos:`n" + ($errores -join "`n") }
-                [System.Windows.Forms.MessageBox]::Show($msg, 'UWF Aulas', 'OK', 'Information') | Out-Null
-                & $preguntarReinicio 'perfil de exclusiones aplicado'
-            } catch {
-                $form.Cursor = 'Default'
-                [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
+        if ($d.ShowDialog() -ne 'OK') { return }
+        try {
+            $perfil = Get-Content -LiteralPath $d.FileName -Raw | ConvertFrom-Json
+            Guardar-Perfil $perfil          # valida los umbrales y rechaza el perfil si no cuadran
+            $p = Leer-Pendientes
+            $nuevos  = 0
+            $errores = New-Object System.Collections.ArrayList
+            foreach ($par in @(@{ t = 'archivo'; v = $perfil.archivos }, @{ t = 'registro'; v = $perfil.registro })) {
+                foreach ($v in @($par.v)) {
+                    if (-not $v) { continue }
+                    try {
+                        if (Add-PendienteExclusion $p $par.t 'add' $v) { $nuevos++ }
+                    } catch { [void]$errores.Add("$v -> $($_.Exception.Message)") }
+                }
             }
+            if ($perfil.overlay) {
+                try {
+                    $o = $perfil.overlay
+                    Set-PendienteDisco $p $(if ($o.tipo -eq 'RAM') {'RAM'} else {'Disco'}) `
+                        ([int]$o.tamanoMB) ([int]$o.avisoMB) ([int]$o.criticoMB)
+                    $nuevos++
+                } catch { [void]$errores.Add("uso del disco -> $($_.Exception.Message)") }
+            }
+            Guardar-Pendientes $p
+            Escribir-Log 'ImportarPerfil' 'OK' "$($perfil.nombre): $nuevos cambios encolados"
+            & $refrescar
+            $msg = "Perfil '$($perfil.nombre)' cargado.`n`n$nuevos cambios encolados como pendientes: revisalos y pulsa ""Aplicar cambios y reiniciar""."
+            if ($errores.Count) { $msg += "`n`nAvisos:`n" + ($errores -join "`n") }
+            [System.Windows.Forms.MessageBox]::Show($msg, 'UWF Aulas', 'OK', 'Information') | Out-Null
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
         }
     })
 
@@ -1246,16 +1736,14 @@ la proteccion por su cuenta en el siguiente arranque.
 
     $btnAplicarOv.Add_Click({
         try {
-            $u = Get-EstadoUwf
             $tipo = if ($radRam.Checked) { 'RAM' } else { 'Disco' }
-            $errores = Aplicar-Overlay -Tipo $tipo -TamanoMB ([int]$numTam.Value) `
-                       -AvisoMB ([int]$numAv.Value) -CriticoMB ([int]$numCr.Value) -FiltroActivo $u.FiltroActual
+            $p = Leer-Pendientes
+            Set-PendienteDisco $p $tipo ([int]$numTam.Value) ([int]$numAv.Value) ([int]$numCr.Value)
+            Guardar-Pendientes $p
+            Escribir-Log 'EncolarUsoDisco' 'OK' `
+                ("tipo=$tipo tamano=$([int]$numTam.Value) aviso=$([int]$numAv.Value) critico=$([int]$numCr.Value)")
             & $refrescar
-            if ($errores.Count) {
-                [System.Windows.Forms.MessageBox]::Show(($errores -join "`n`n"), 'UWF Aulas', 'OK', 'Warning') | Out-Null
-            } else {
-                & $preguntarReinicio 'configuracion del overlay'
-            }
+            $lblBarra.Text = 'Uso del disco encolado como pendiente'
         } catch {
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
         }
@@ -1299,7 +1787,7 @@ la proteccion por su cuenta en el siguiente arranque.
     $numHoras.Value = [int]$(if ($cfg.horasMaxMantenimiento) { $cfg.horasMaxMantenimiento } else { 8 })
 
     $estadoActual = Leer-Estado
-    if ($estadoActual -and $estadoActual.fase -eq 'mantenimiento') { $tabs.SelectedTab = $tabMant }
+    if ($estadoActual -and (@('mantenimiento','aplicando') -contains $estadoActual.fase)) { $tabs.SelectedTab = $tabMant }
 
     & $refrescar
     [void]$form.ShowDialog()
