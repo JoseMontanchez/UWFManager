@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 build/
 dist/
+
+# Perfiles y notas propias de cada centro: nombres de programas, rutas y claves reales.
+# No se versionan: el catalogo del codigo es generico a proposito.
+*.local.json
+*.local.md
+UWF-Aulas-contexto.md

@@ -1,6 +1,6 @@
 ---
 name: catalogo-exclusiones
-description: Añade, corrige o verifica entradas del catálogo de exclusiones por programa (Kaspersky, pGina, Adobe, Java, navegadores, software de facultad…) en las dos implementaciones. Úsalo cuando haya que cubrir un programa nuevo, cuando las rutas de un programa del catálogo hayan cambiado de versión, o cuando se pida investigar qué debe excluirse de UWF para que un software funcione en un equipo no persistente.
+description: Añade, corrige o verifica entradas del catálogo de exclusiones por programa (antivirus, agentes de gestión, gestores de login, lectores de PDF, navegadores, software específico de un centro) en las dos implementaciones. Úsalo cuando haya que cubrir un programa nuevo, cuando las rutas de un programa del catálogo hayan cambiado de versión, o cuando se pida investigar qué debe excluirse de UWF para que un software funcione en un equipo no persistente.
 tools: Read, Grep, Glob, Edit, PowerShell, WebSearch, WebFetch
 ---
 
@@ -10,46 +10,52 @@ protección de UWF para que un programa sobreviva a los reinicios.
 
 ## Qué es el catálogo
 
-Un array al principio de cada implementación — `$script:Catalogo` en
-`UWF-Aulas.ps1:42` y `Catalogo` en `UWF-Aulas.py:71` — con esta forma:
+Un array al principio de cada implementación — `$script:Catalogo` en `UWF-Aulas.ps1` y
+`Catalogo` en `UWF-Aulas.py` — con esta forma:
 
 ```powershell
 @{
-    Nombre   = 'Kaspersky (antivirus y agente de red)'
-    Patron   = 'Kaspersky'                      # regex contra el DisplayName instalado
-    Carpetas = @('C:\ProgramData\Kaspersky*')   # globs; solo se proponen si existen
-    Claves   = @('HKLM\SOFTWARE\KasperskyLab')  # HKLM; solo se proponen si existen
+    Nombre   = '<Programa> (para que sirve)'
+    Patron   = '<regex contra el DisplayName instalado>'
+    Carpetas = @('C:\ProgramData\<Fabricante>*')   # globs; solo se proponen si existen
+    Claves   = @('HKLM\SOFTWARE\<Fabricante>')     # HKLM; solo se proponen si existen
 }
 ```
 
 ```python
 {
-    'Nombre':   'Kaspersky (antivirus y agente de red)',
-    'Patron':   'Kaspersky',
-    'Carpetas': [r'C:\ProgramData\Kaspersky*'],
-    'Claves':   [r'HKLM\SOFTWARE\KasperskyLab'],
+    'Nombre':   '<Programa> (para que sirve)',
+    'Patron':   '<regex contra el DisplayName instalado>',
+    'Carpetas': [r'C:\ProgramData\<Fabricante>*'],
+    'Claves':   [r'HKLM\SOFTWARE\<Fabricante>'],
 }
 ```
 
-Cubierto hoy: Kaspersky, pGina, Microsoft Defender, ESET, Sophos. El catálogo es el
-**nivel 1** de `Get-PropuestasExclusion` / `get_propuestas_exclusion` (rutas verificadas);
-el nivel 2 es una heurística que busca por nombre del programa y fabricante en
-`C:\ProgramData` y `HKLM\SOFTWARE(\WOW6432Node)`. Cada entrada que añades al catálogo es
-un programa que deja de depender de la heurística, y la GUI se lo dice al técnico
-("catálogo verificado" vs "revísalo").
+Hoy el catálogo cubre cinco entradas: un antivirus de endpoint con agente de gestión
+centralizada, un gestor de login de terceros, el antivirus incluido en Windows y dos
+antivirus más. **Los nombres y las rutas concretas están en el array del código, y a
+propósito no se repiten en esta documentación** — léelos de ahí cuando los necesites. Esa
+es también la regla al ampliarlo: las marcas van al código, no a los `.md` ni al README,
+que se leen de un vistazo en el repositorio.
+
+El catálogo es el **nivel 1** de `Get-PropuestasExclusion` / `get_propuestas_exclusion`
+(rutas verificadas en el equipo); el nivel 2 es una heurística que busca por nombre del
+programa y del fabricante en `C:\ProgramData` y `HKLM\SOFTWARE(\WOW6432Node)`, y es la que
+actúa para todo lo que no esté en el catálogo. Cada entrada que se añade es un programa que
+deja de depender de la heurística, y la GUI se lo dice al técnico ("catálogo verificado" vs
+"revísalo").
 
 ## Criterio para decidir qué excluir
 
-El entorno es un aula con **un usuario local compartido** (`Profesor`) cuyo perfil se
-resetea en cada reinicio. Es una cuenta local del equipo, **no** un usuario creado a
-partir del LDAP: aunque `UWF-Aulas-contexto.md` describa el login por pGina, la
-herramienta se usa sobre el usuario local, así que no hay nada de identidad de dominio
-que persistir. Se excluye solo lo que **debe persistir entre reinicios**:
+El entorno es un aula con **una cuenta local compartida** cuyo perfil se resetea en cada
+reinicio. Es una cuenta local del equipo, no un usuario de dominio, así que no hay nada de
+identidad de dominio que persistir. Se excluye solo lo que **debe persistir entre
+reinicios**:
 
 - **Sí**: definiciones de antivirus, identificadores de agente/host registrados en una
   consola central, licencias activadas por equipo, bases de datos de configuración del
   propio programa, logs que IT necesita conservar.
-- **No**: cachés, temporales, nada bajo el perfil del usuario (`C:\Users\Profesor`) —
+- **No**: cachés, temporales, nada bajo el perfil del usuario (`C:\Users\<cuenta>`) —
   el objetivo del proyecto es precisamente que ese perfil se limpie solo, y excluirlo
   destruiría la razón de ser de la herramienta.
 - **Jamás**: `SoftwareDistribution`, `WinSxS`, `servicing`, `$WINDOWS.~BT`, `catroot2`
@@ -60,9 +66,9 @@ defecto). Una exclusión amplia "por si acaso" es un error: llena el overlay y f
 reinicios a media clase.
 
 Para antivirus y agentes de gestión, **busca la guía del fabricante para entornos no
-persistentes / VDI**: suele listar exactamente qué hay que persistir. El caso conocido
-pendiente de validar es Kaspersky Security Center duplicando hosts cuando el ID del
-Agente de Red se regenera en cada arranque.
+persistentes / VDI**: suele listar exactamente qué hay que persistir. El fallo clásico es
+que la consola central acabe llena de equipos fantasma porque el identificador del agente
+se regenera en cada arranque al vivir su almacén dentro del espacio temporal.
 
 ## Cómo trabajas
 
@@ -75,8 +81,9 @@ Agente de Red se regenera en cada arranque.
      Select-Object DisplayName, Publisher, InstallLocation, DisplayVersion
    ```
 2. Escribe un `Patron` que case con todas las variantes de nombre del producto y con
-   ninguna otra cosa (`'Kaspersky'` cubre endpoint y agente; `'Microsoft Defender|Windows
-   Defender'` cubre el renombrado). Evita patrones de menos de 4 caracteres.
+   ninguna otra cosa: un patrón por la marca suele cubrir a la vez el endpoint y su agente,
+   y la alternancia `'<NombreNuevo>|<NombreViejo>'` cubre productos que se han renombrado
+   entre versiones. Evita patrones de menos de 4 caracteres.
 3. Comprueba qué existe de verdad antes de proponerlo: `Test-Path` para carpetas,
    `Test-Path 'HKLM:\SOFTWARE\...'` para claves. Documenta en el PR/resumen en qué
    versión del programa lo verificaste — las rutas cambian entre versiones y esa es la

@@ -7,11 +7,11 @@ tools: Read, Grep, Glob
 Revisas código de UWF Aulas buscando los fallos que **rompen aulas en producción**, no
 cuestiones de estilo. Eres de solo lectura: informas, no arreglas.
 
-Lee `UWF-Aulas-contexto.md` antes de la primera revisión de la sesión (sección 5,
-"Decisiones importantes ya tomadas", y sección 6, "Cosas que se validan en un aula
-real"). El coste de un fallo aquí es alto: equipos a los que hay que ir físicamente,
-exámenes y credenciales de profesores expuestos si la protección no se reactiva, o
-Windows Update roto en N aulas a la vez.
+Lee los encabezados `Cambios v2` / `Cambios v3` de `UWF-Aulas.ps1` y `UWF-Aulas.py` antes
+de la primera revisión de la sesión: resumen las decisiones de diseño vigentes. El coste de
+un fallo aquí es alto: equipos a los que hay que ir físicamente, datos de un usuario
+expuestos al siguiente si la protección no se reactiva, o Windows Update roto en todas las
+aulas a la vez.
 
 ## Invariantes a verificar
 

@@ -19,8 +19,11 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
   - Bloqueo automatico de rutas que romperian Windows Update
     (`SoftwareDistribution`, `WinSxS`, `servicing`, `$WINDOWS.~BT`, `catroot2`).
   - **Exclusiones por programa**: detecta el software instalado y propone las rutas/claves
-    a excluir. Catalogo curado para Kaspersky, pGina, Defender, ESET y Sophos; heuristica
-    de busqueda por nombre para cualquier otro programa.
+    a excluir. Trae un catalogo curado para el tipo de software que suele haber en un aula
+    (antivirus de endpoint y su agente de gestion, gestor de login de terceros, el
+    antivirus de Windows) y, para cualquier otro programa, una heuristica que busca por
+    nombre del programa y del fabricante en `C:\ProgramData` y `HKLM\SOFTWARE`. El
+    catalogo esta al principio de cada implementacion, por si hay que ampliarlo.
   - Importar/exportar el conjunto de exclusiones como perfil JSON.
 - **Cambios pendientes**: todo lo que configura el tecnico (exclusiones y uso del disco)
   se encola y **no llega a UWF hasta pulsar "Aplicar cambios y reiniciar"**. Asi puede
@@ -88,8 +91,9 @@ pyinstaller --noconfirm --clean UWF-Aulas.spec
 ```
 
 El `.spec` es la configuracion autoritativa (`--onefile`, `--windowed`, `--uac-admin`,
-nombre `UWF-Aulas`). Compilar con el `.spec` en lugar de repetir los argumentos a mano
+nombre `UWFManager`). Compilar con el `.spec` en lugar de repetir los argumentos a mano
 evita que la linea de compilacion y lo versionado se separen.
 
-El resultado queda en `dist\UWF-Aulas.exe`: un unico ejecutable, sin necesitar Python
-instalado en el equipo destino, que pide elevacion automaticamente al abrirse.
+El resultado queda en `dist\UWFManager.exe`: un unico ejecutable, sin necesitar Python
+instalado en el equipo destino, que pide elevacion automaticamente al abrirse. El `.exe`
+no se versiona en el repositorio.

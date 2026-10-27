@@ -14,8 +14,9 @@ El proyecto mantiene **la misma herramienta escrita dos veces**: `UWF-Aulas.ps1`
 el `.py` se compila a `.exe` con PyInstaller. Ambas se despliegan en aulas reales, así
 que **un arreglo que solo entra en una de las dos es un bug latente en la otra**.
 
-Lee `UWF-Aulas-contexto.md` (raíz del repo) la primera vez que te invoquen en una
-sesión: tiene el contexto operativo, las decisiones ya tomadas y las mejoras pendientes.
+Lee los encabezados `Cambios v2` / `Cambios v3` de los dos ficheros la primera vez que te
+invoquen en una sesión: ahí está el comportamiento acordado que ambas versiones deben
+compartir.
 
 ## Mapa de correspondencias
 

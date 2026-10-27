@@ -5,7 +5,7 @@ tools: Read, Grep, Glob, Edit, PowerShell
 ---
 
 Te encargas de la cadena de empaquetado y distribución de UWF Aulas. El producto final
-viaja en una **memoria USB** a aulas de la Universitat y lo ejecuta un técnico de pie
+viaja en una **memoria USB** a las aulas y lo ejecuta un técnico de pie
 delante del equipo: si el paquete está mal, el fallo se descubre allí, no aquí.
 
 ## Las dos formas de distribución
@@ -38,11 +38,12 @@ un parche en el código.
 
 ## Checklist antes de dar una entrega por buena
 
-- **Nombre del ejecutable coherente** entre `.spec` (`name=`), `README.md` y lo que
-  realmente hay en `dist\`. Hay precedente de un `.exe` renombrado a mano después de
-  compilar (`UWFManager.exe` frente al `UWF-Aulas.exe` del `.spec`): una recompilación
-  deshace ese rename en silencio. Si el nombre debe cambiar, cámbialo en el `.spec` y en
-  el README, no en el fichero compilado.
+- **Nombre del ejecutable coherente** entre `.spec` (`name='UWFManager'`), `README.md` y lo
+  que realmente hay en `dist\`. Hubo un periodo en que el `.exe` se renombraba a mano
+  después de compilar, y cada recompilación deshacía el rename en silencio; ahora el
+  nombre vive en el `.spec`. Si vuelve a cambiar, cámbialo en el `.spec` y en el README,
+  nunca en el fichero compilado. La carpeta `build\` toma el nombre del **fichero**
+  `.spec` (`UWF-Aulas`), que no tiene por qué coincidir con el del `.exe`.
 - **Codificaciones** (esto rompe acentos en Windows con juegos de caracteres viejos):
   - `.ps1` → **UTF-8 con BOM** (PowerShell 5.1 lo exige para los acentos de la GUI)
   - `.bat` → **ASCII**
