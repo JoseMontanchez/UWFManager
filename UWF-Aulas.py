@@ -39,6 +39,7 @@ import glob
 import json
 import socket
 import shutil
+import hashlib
 import subprocess
 from datetime import datetime
 
@@ -952,12 +953,134 @@ def _accion_lanzamiento():
     return _pythonw(), '"%s" --vigilante' % ScriptDest
 
 
+def _huella(ruta):
+    """Hash SHA-256 de un fichero. Sirve para saber si la copia instalada es exactamente la
+    misma que se esta ejecutando, sin depender de un numero de version que hay que recordar
+    subir a mano en cada compilacion."""
+    h = hashlib.sha256()
+    with open(ruta, 'rb') as fh:
+        for trozo in iter(lambda: fh.read(65536), b''):
+            h.update(trozo)
+    return h.hexdigest()
+
+
+def detectar_instalacion(origen=None):
+    """Mira que hay instalado ya en ProgramData.
+
+    Devuelve {Existe, Bytes, Huella, EsLaMisma}. 'EsLaMisma' compara con lo que se esta
+    ejecutando: si coincide, no hay nada que sustituir.
+    """
+    r = {'Existe': False, 'Bytes': 0, 'Huella': '', 'EsLaMisma': False}
+    if not os.path.isfile(ScriptDest):
+        return r
+    r['Existe'] = True
+    try:
+        r['Bytes'] = os.path.getsize(ScriptDest)
+        r['Huella'] = _huella(ScriptDest)
+        if origen and os.path.isfile(origen):
+            r['EsLaMisma'] = (r['Huella'] == _huella(origen))
+    except Exception:
+        pass
+    return r
+
+
+def _detener_tarea():
+    """Termina la instancia en curso de la tarea del vigilante, si la hay.
+
+    Hace falta porque el vigilante arranca con el equipo: si todavia esta corriendo, su .exe
+    esta en uso y Windows no deja sobrescribirlo.
+    """
+    try:
+        subprocess.run(['schtasks', '/end', '/tn', Tarea],
+                       capture_output=True, text=True, shell=False)
+    except Exception:
+        pass
+
+
+def _limpiar_restos():
+    """Borra los apartados .old-* de sustituciones anteriores y el .py suelto que pudiera
+    haber dejado una instalacion de desarrollo cuando ahora se ejecuta el .exe."""
+    borrados = []
+    try:
+        for nombre in os.listdir(Base):
+            ruta = os.path.join(Base, nombre)
+            if '.old-' in nombre and os.path.isfile(ruta):
+                try:
+                    os.remove(ruta)
+                    borrados.append(nombre)
+                except OSError:
+                    pass          # sigue en uso: se intentara en el proximo arranque
+        if Congelado:
+            viejo_py = os.path.join(Base, 'UWF-Aulas.py')
+            if os.path.isfile(viejo_py):
+                try:
+                    os.remove(viejo_py)
+                    borrados.append('UWF-Aulas.py')
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return borrados
+
+
+def reemplazar_instalado(origen):
+    """Sustituye la copia de ProgramData por la version que se esta ejecutando ahora.
+
+    Tres intentos, de menos a mas invasivo, porque Windows no permite sobrescribir un
+    ejecutable en uso:
+      1. Copiar encima.
+      2. Terminar la tarea del vigilante (que es quien suele tenerlo abierto) y repetir.
+      3. Apartar el instalado a un '.old-<fecha>' y copiar la nueva al lado. Renombrar un
+         .exe en uso si esta permitido; el .old se borra en la siguiente ejecucion.
+
+    Devuelve (accion, detalle). Lanza excepcion solo si los tres intentos fallan, para que
+    quien llama pueda avisar al tecnico: una copia instalada vieja con una GUI nueva es
+    peligrosa, porque el vigilante antiguo no conoce la fase 'aplicando'.
+    """
+    previo = detectar_instalacion(origen)
+
+    if not previo['Existe']:
+        shutil.copy2(origen, ScriptDest)
+        return 'instalado', 'primera instalacion en este equipo'
+
+    if previo['EsLaMisma']:
+        return 'sin cambios', 'la copia instalada ya es esta misma version'
+
+    detalle = '%d -> %d bytes' % (previo['Bytes'], os.path.getsize(origen))
+
+    try:
+        shutil.copy2(origen, ScriptDest)
+        return 'sustituido', detalle
+    except (OSError, PermissionError):
+        pass
+
+    _detener_tarea()
+    try:
+        shutil.copy2(origen, ScriptDest)
+        return 'sustituido', '%s (tras detener la tarea)' % detalle
+    except (OSError, PermissionError):
+        pass
+
+    apartado = '%s.old-%s' % (ScriptDest, _now('%Y%m%d%H%M%S'))
+    os.replace(ScriptDest, apartado)      # si esto falla, propaga: no hay mas que intentar
+    shutil.copy2(origen, ScriptDest)
+    return 'sustituido', '%s (la anterior estaba en uso, apartada como %s)' % (
+        detalle, os.path.basename(apartado))
+
+
 def instalar_vigilante():
-    """Copia el script/exe a ProgramData y registra la tarea programada que lanza el modo vigilante al arrancar."""
+    """Sustituye la copia instalada por esta version y registra la tarea programada que lanza
+    el modo vigilante en cada arranque. Se ejecuta en cada arranque de la GUI, no solo la
+    primera vez, para que actualizar el equipo sea solo abrir el .exe nuevo."""
     inicializar_carpeta()
     origen = _script_origen()
     if origen and os.path.normcase(origen) != os.path.normcase(ScriptDest):
-        shutil.copy2(origen, ScriptDest)
+        accion, detalle = reemplazar_instalado(origen)
+        if accion != 'sin cambios':
+            escribir_log('ActualizarInstalacion', 'OK', '%s: %s' % (accion, detalle))
+        restos = _limpiar_restos()
+        if restos:
+            escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
 
     ejecutable, argumento = _accion_lanzamiento()
     ps = (
@@ -1970,6 +2093,16 @@ def main(argv=None):
         crear_acceso_directo()
     except Exception as ex:
         escribir_log('Autoinstalacion', 'ERROR', str(ex))
+        # No basta con dejarlo en el log: si la copia de ProgramData se ha quedado en una
+        # version anterior, el vigilante que corre al arrancar no conoce la fase 'aplicando'
+        # y un equipo podria quedarse sin proteccion. El tecnico tiene que saberlo.
+        _avisar(
+            'No se ha podido actualizar la copia instalada en\n%s\n\n%s\n\n'
+            'La herramienta se abrira igualmente, pero NO uses "Aplicar cambios y reiniciar" '
+            'hasta resolverlo: el vigilante que arranca con el equipo seguiria siendo el '
+            'anterior. Cierra la herramienta, espera unos segundos tras el arranque y vuelve '
+            'a ejecutarla.' % (ScriptDest, ex)
+        )
 
     mostrar_interfaz()
     return 0

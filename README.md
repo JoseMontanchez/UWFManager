@@ -68,11 +68,17 @@ cambios sin aplicar) y `uwf-aulas.log`.
 
 ## Uso
 
-- **Modo normal** (sin argumentos): abre la GUI. Pide privilegios de administrador y, la
-  primera vez que se ejecuta en un equipo, se auto-instala:
+- **Modo normal** (sin argumentos): abre la GUI. Pide privilegios de administrador y, cada vez
+  que se ejecuta, se asegura de que el equipo tiene esta version instalada:
   - Se copia a `C:\ProgramData\UWF-Aulas\`.
   - Registra la tarea programada `UWF-Aulas-Vigilante` (arranque, como `SYSTEM`).
   - Crea el acceso directo `UWF Aulas.lnk` en el escritorio publico.
+- **Actualizar un equipo** es, por tanto, solo ejecutar la version nueva: compara por hash la
+  copia instalada con la que se esta ejecutando y la sustituye si difieren. Como Windows no
+  deja sobrescribir un ejecutable en uso, si el vigilante lo tiene abierto termina su tarea y
+  reintenta, y en ultimo caso aparta el anterior a un `.old-<fecha>` que borra en el arranque
+  siguiente. Si aun asi no pudiera sustituirlo, **avisa al tecnico**: una interfaz nueva con
+  un vigilante antiguo no sabria cerrar la fase de aplicacion de cambios pendientes.
 - **Modo vigilante** (`-Vigilante` / `--vigilante`): sin interfaz, es el que lanza la tarea
   programada en cada arranque.
 

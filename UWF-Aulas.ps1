@@ -720,11 +720,106 @@ function Aplicar-Perfil($perfil, [bool]$FiltroActivo = $false) {
 # -----------------------------------------------------------------------------
 #  Tarea vigilante y autoinstalacion
 # -----------------------------------------------------------------------------
+function Get-Huella([string]$ruta) {
+    # Hash SHA-256 de un fichero. Sirve para saber si la copia instalada es exactamente la
+    # misma que se esta ejecutando, sin depender de un numero de version que hay que recordar
+    # subir a mano en cada compilacion.
+    return (Get-FileHash -LiteralPath $ruta -Algorithm SHA256).Hash
+}
+
+function Detectar-Instalacion([string]$Origen) {
+    # Mira que hay instalado ya en ProgramData. 'EsLaMisma' compara con lo que se esta
+    # ejecutando: si coincide, no hay nada que sustituir.
+    $r = [pscustomobject]@{ Existe = $false; Bytes = 0; Huella = ''; EsLaMisma = $false }
+    if (-not (Test-Path -LiteralPath $script:ScriptDest)) { return $r }
+    $r.Existe = $true
+    try {
+        $r.Bytes  = (Get-Item -LiteralPath $script:ScriptDest).Length
+        $r.Huella = Get-Huella $script:ScriptDest
+        if ($Origen -and (Test-Path -LiteralPath $Origen)) {
+            $r.EsLaMisma = ($r.Huella -eq (Get-Huella $Origen))
+        }
+    } catch { }
+    return $r
+}
+
+function Detener-Tarea {
+    # Termina la instancia en curso de la tarea del vigilante, si la hay. Hace falta porque el
+    # vigilante arranca con el equipo: si todavia corre, su fichero esta en uso.
+    try { & schtasks.exe /end /tn $script:Tarea 2>&1 | Out-Null } catch { }
+}
+
+function Limpiar-Restos {
+    # Borra los apartados .old-* de sustituciones anteriores y el .exe suelto que pudiera
+    # haber dejado una instalacion empaquetada cuando ahora se ejecuta el .ps1.
+    $borrados = New-Object System.Collections.ArrayList
+    try {
+        foreach ($f in @(Get-ChildItem -LiteralPath $script:Base -File -ErrorAction SilentlyContinue)) {
+            if ($f.Name -like '*.old-*') {
+                try {
+                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                    [void]$borrados.Add($f.Name)
+                } catch { }   # sigue en uso: se intentara en el proximo arranque
+            }
+        }
+    } catch { }
+    return $borrados
+}
+
+function Reemplazar-Instalado([string]$Origen) {
+    # Sustituye la copia de ProgramData por la version que se esta ejecutando ahora.
+    #
+    # Tres intentos, de menos a mas invasivo, porque Windows no permite sobrescribir un
+    # fichero en uso:
+    #   1. Copiar encima.
+    #   2. Terminar la tarea del vigilante (que es quien suele tenerlo abierto) y repetir.
+    #   3. Apartar el instalado a un '.old-<fecha>' y copiar la nueva al lado. Renombrar un
+    #      ejecutable en uso si esta permitido; el .old se borra en la siguiente ejecucion.
+    #
+    # Devuelve (Accion, Detalle). Lanza excepcion solo si los tres fallan, para que quien
+    # llama pueda avisar al tecnico: una copia instalada vieja con una GUI nueva es peligrosa,
+    # porque el vigilante antiguo no conoce la fase 'aplicando'.
+    $previo = Detectar-Instalacion $Origen
+
+    if (-not $previo.Existe) {
+        Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force
+        return @('instalado', 'primera instalacion en este equipo')
+    }
+    if ($previo.EsLaMisma) {
+        return @('sin cambios', 'la copia instalada ya es esta misma version')
+    }
+
+    $detalle = "$($previo.Bytes) -> $((Get-Item -LiteralPath $Origen).Length) bytes"
+
+    try {
+        Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force -ErrorAction Stop
+        return @('sustituido', $detalle)
+    } catch { }
+
+    Detener-Tarea
+    try {
+        Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force -ErrorAction Stop
+        return @('sustituido', "$detalle (tras detener la tarea)")
+    } catch { }
+
+    $apartado = "$($script:ScriptDest).old-$(Get-Date -Format 'yyyyMMddHHmmss')"
+    Move-Item -LiteralPath $script:ScriptDest -Destination $apartado -Force -ErrorAction Stop
+    Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force
+    return @('sustituido', "$detalle (la anterior estaba en uso, apartada como $(Split-Path $apartado -Leaf))")
+}
+
 function Instalar-Vigilante {
+    # Se ejecuta en cada arranque de la GUI, no solo la primera vez, para que actualizar un
+    # equipo sea solo abrir la version nueva.
     Inicializar-Carpeta
     $origen = $PSCommandPath
     if ($origen -and ($origen -ne $script:ScriptDest)) {
-        Copy-Item -LiteralPath $origen -Destination $script:ScriptDest -Force
+        $res = Reemplazar-Instalado $origen
+        if ($res[0] -ne 'sin cambios') {
+            Escribir-Log 'ActualizarInstalacion' 'OK' "$($res[0]): $($res[1])"
+        }
+        $restos = @(Limpiar-Restos)
+        if ($restos.Count) { Escribir-Log 'LimpiarRestos' 'OK' ($restos -join ', ') }
     }
     $accion   = New-ScheduledTaskAction -Execute 'powershell.exe' `
                 -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Vigilante' -f $script:ScriptDest)
@@ -1820,6 +1915,17 @@ try {
     Crear-AccesoDirecto
 } catch {
     Escribir-Log 'Autoinstalacion' 'ERROR' $_.Exception.Message
+    # No basta con dejarlo en el log: si la copia de ProgramData se ha quedado en una version
+    # anterior, el vigilante que corre al arrancar no conoce la fase 'aplicando' y un equipo
+    # podria quedarse sin proteccion. El tecnico tiene que saberlo.
+    [System.Windows.Forms.MessageBox]::Show(
+        ("No se ha podido actualizar la copia instalada en`n$($script:ScriptDest)`n`n" +
+         "$($_.Exception.Message)`n`n" +
+         'La herramienta se abrira igualmente, pero NO uses "Aplicar cambios y reiniciar" ' +
+         'hasta resolverlo: el vigilante que arranca con el equipo seguiria siendo el ' +
+         'anterior. Cierra la herramienta, espera unos segundos tras el arranque y vuelve a ' +
+         'ejecutarla.'),
+        'UWF Aulas', 'OK', 'Warning') | Out-Null
 }
 
 Mostrar-Interfaz
