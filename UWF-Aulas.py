@@ -43,6 +43,7 @@ import shutil
 import hashlib
 import subprocess
 from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 
 try:
     import winreg
@@ -1254,16 +1255,50 @@ def instalar_vigilante():
             escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
 
     ejecutable, argumento = _accion_lanzamiento()
-    ps = (
-        "$a = New-ScheduledTaskAction -Execute '%s' -Argument '%s';"
-        "$t = New-ScheduledTaskTrigger -AtStartup;"
-        "$p = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest;"
-        "$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable;"
-        "Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null"
-    ) % (ejecutable, argumento, Tarea)
-    subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                   capture_output=True, text=True, shell=False, check=True, **_sin_ventana())
+    # Se registra con schtasks.exe y un XML en vez de PowerShell oculto: lanzar PowerShell sin
+    # ventana para crear una tarea de arranque como SYSTEM es justo lo que buscan las heuristicas
+    # de los antivirus. El XML permite los mismos ajustes que New-ScheduledTaskSettingsSet
+    # (con baterias, StartWhenAvailable), que schtasks no ofrece por linea de comandos.
+    xml = _xml_tarea(ejecutable, argumento)
+    ruta_xml = os.path.join(Base, 'tarea-vigilante.xml')
+    with open(ruta_xml, 'w', encoding='utf-16') as fh:
+        fh.write(xml)
+    try:
+        subprocess.run(['schtasks', '/create', '/tn', Tarea, '/xml', ruta_xml, '/f'],
+                       capture_output=True, text=True, shell=False, check=True, **_sin_ventana())
+    finally:
+        try:
+            os.remove(ruta_xml)
+        except OSError:
+            pass
     escribir_log('InstalarVigilante', 'OK', ScriptDest)
+
+
+def _xml_tarea(ejecutable, argumento):
+    """Definicion de la tarea del vigilante: al arrancar el equipo, como SYSTEM (S-1-5-18) con
+    privilegios maximos, tambien con bateria. Mismos valores por defecto que
+    Register-ScheduledTask (IgnoreNew, limite de 72 h)."""
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo><Description>Vigilante de UWFManager</Description></RegistrationInfo>\n'
+        '  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>\n'
+        '    <Enabled>true</Enabled>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec><Command>%s</Command><Arguments>%s</Arguments></Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n'
+    ) % (xml_escape(ejecutable), xml_escape(argumento))
 
 
 def crear_acceso_directo():
@@ -1559,7 +1594,7 @@ def instalar_caracteristica_uwf():
                  "-ErrorAction Stop | Out-Null" % Caracteristica)
         try:
             codigo2, salida2 = _ejecutar_oculto([ps, '-NoProfile', '-NonInteractive',
-                                                 '-ExecutionPolicy', 'Bypass', '-Command', orden])
+                                                 '-Command', orden])
         except Exception as ex:
             codigo2, salida2 = -1, str(ex)
         intentos.append(('powershell', codigo2, salida2))

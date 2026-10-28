@@ -69,6 +69,7 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 | `UWFAulas.bat` | Lanzador del `.py`. |
 | `docs/FUNCIONAMIENTO.md` | Documentacion del funcionamiento interno. |
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
+| `version_info.txt` | Datos de version del `.exe` (Propiedades > Detalles). |
 | `.claude/agents/` | Agentes de Claude Code del proyecto: paridad entre las dos implementaciones, revision de los invariantes de UWF, catalogo de exclusiones y empaquetado. |
 
 Estado que la herramienta guarda en el equipo, en `C:\ProgramData\UWF-Aulas\`:
@@ -106,8 +107,8 @@ pip install wmi pywin32 pyinstaller
 pyinstaller --noconfirm --clean UWF-Aulas.spec
 ```
 
-El `.spec` es la configuracion autoritativa (`--onefile`, `--windowed`, `--uac-admin`,
-nombre `UWFManager`). Compilar con el `.spec` en lugar de repetir los argumentos a mano
+El `.spec` es la configuracion autoritativa (`--onefile`, `--windowed`, `--uac-admin`, sin UPX,
+nombre `UWFManager` e informacion de version tomada de `version_info.txt`). Compilar con el `.spec` en lugar de repetir los argumentos a mano
 evita que la linea de compilacion y lo versionado se separen.
 
 El resultado queda en `dist\UWFManager.exe`: un unico ejecutable, sin necesitar Python
