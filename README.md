@@ -4,6 +4,10 @@ Herramienta para gestionar el **Unified Write Filter (UWF)** de Windows. Sustitu
 cubre software de terceros como el antivirus) por una ventana de mantenimiento controlada,
 con una GUI pensada para que un tecnico la use en el aula sin margen de error.
 
+El funcionamiento interno (fases, vigilante, cola de cambios, formatos de los ficheros,
+garantias de seguridad y diagnostico de problemas) esta explicado en
+[docs/FUNCIONAMIENTO.md](docs/FUNCIONAMIENTO.md).
+
 ## Que hace
 
 - **Estado**: lee en vivo si UWF esta instalado, si el filtro esta activo, que volumenes
@@ -15,7 +19,8 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
   internamente (WMI, `uwfmgr` y las claves de los perfiles JSON) se conserva el termino
   original.
 - **Exclusiones**: gestiona que carpetas/archivos y claves de registro (`HKLM`) quedan
-  fuera de la proteccion de UWF, con:
+  fuera de la proteccion de UWF. La pestana muestra las exclusiones que el equipo ya tiene
+  permitidas, distinguiendo las que valen ahora de las que solo valdran tras reiniciar, con:
   - Bloqueo automatico de rutas que romperian Windows Update
     (`SoftwareDistribution`, `WinSxS`, `servicing`, `$WINDOWS.~BT`, `catroot2`).
   - **Exclusiones por programa**: detecta el software instalado y propone las rutas/claves
@@ -23,7 +28,8 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
     (antivirus de endpoint y su agente de gestion, gestor de login de terceros, el
     antivirus de Windows) y, para cualquier otro programa, una heuristica que busca por
     nombre del programa y del fabricante en `C:\ProgramData` y `HKLM\SOFTWARE`. El
-    catalogo esta al principio de cada implementacion, por si hay que ampliarlo.
+    catalogo esta al principio de cada implementacion, por si hay que ampliarlo. Las
+    propuestas de la heuristica aparecen sin marcar y nunca incluyen raices del sistema.
   - Importar/exportar el conjunto de exclusiones como perfil JSON.
 - **Cambios pendientes**: todo lo que configura el tecnico (exclusiones y uso del disco)
   se encola y **no llega a UWF hasta pulsar "Aplicar cambios y reiniciar"**. Asi puede
@@ -44,7 +50,8 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
   3. Finalizar y proteger -> reactiva el filtro y reinicia.
 - **Vigilante**: una tarea programada (ejecutada como `SYSTEM` en cada arranque) vigila que
   la proteccion vuelva a activarse tras un mantenimiento y, si alguien se olvida de
-  cerrarlo, reactiva la proteccion sola pasadas unas horas configurables. Tambien es quien
+  cerrarlo, reactiva la proteccion sola pasadas unas horas configurables (si el filtro no
+  vuelve, lo reintenta como mucho tres reinicios para no entrar en bucle). Tambien es quien
   aplica los cambios pendientes en los arranques sin proteccion, y reactiva el filtro
   aunque la aplicacion falle: el equipo no se queda desprotegido.
 - **Registro**: cada accion queda en un log CSV local (`C:\ProgramData\UWF-Aulas\uwf-aulas.log`)
@@ -58,6 +65,7 @@ con una GUI pensada para que un tecnico la use en el aula sin margen de error.
 | `UWF-Aulas.bat` | Lanzador del `.ps1` (pide elevacion si hace falta). |
 | `UWF-Aulas.py` | Port a Python + Tkinter, mismo comportamiento. |
 | `UWFAulas.bat` | Lanzador del `.py`. |
+| `docs/FUNCIONAMIENTO.md` | Documentacion del funcionamiento interno. |
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
 | `.claude/agents/` | Agentes de Claude Code del proyecto: paridad entre las dos implementaciones, revision de los invariantes de UWF, catalogo de exclusiones y empaquetado. |
 

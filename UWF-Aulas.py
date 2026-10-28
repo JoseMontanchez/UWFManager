@@ -64,6 +64,7 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 Tarea      = 'UWF-Aulas-Vigilante'
+MaxReintentosFiltro = 3   # reinicios que el vigilante intenta para reactivar el filtro
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
 Prohibidas = [
@@ -113,10 +114,39 @@ Catalogo = [
     },
 ]
 
+# Palabras que la heuristica de "Anadir por programa" no usa como termino de busqueda: son
+# tan genericas que casarian con medio sistema (p. ej. el fabricante 'Microsoft' proponia
+# excluir HKLM\SOFTWARE\Microsoft entero).
+TerminosGenericos = {
+    'microsoft', 'windows', 'corporation', 'corp', 'update', 'updates', 'software',
+    'program', 'programs', 'system', 'systems', 'service', 'services', 'driver', 'drivers',
+    'runtime', 'redistributable', 'tools', 'client', 'edition', 'version', 'package',
+    'components', 'framework', 'technologies', 'limited', 'company', 'intel', 'x64-based',
+}
+
+# Carpetas y claves raiz que nunca se proponen por heuristica, aunque casen por nombre
+RaicesSistema = {
+    r'C:\PROGRAMDATA\MICROSOFT',
+    r'HKLM\SOFTWARE\MICROSOFT', r'HKLM\SOFTWARE\WOW6432NODE\MICROSOFT',
+    r'HKLM\SOFTWARE\CLASSES', r'HKLM\SOFTWARE\WOW6432NODE\CLASSES',
+    r'HKLM\SOFTWARE\POLICIES', r'HKLM\SOFTWARE\WOW6432NODE\POLICIES',
+    r'HKLM\SOFTWARE\WOW6432NODE', r'HKLM\SOFTWARE\CLIENTS',
+}
+
 
 # =============================================================================
 #  Utilidades
 # =============================================================================
+
+def _sin_ventana():
+    """Argumentos para subprocess que evitan abrir una consola y no heredan stdin.
+
+    El .exe se compila sin consola: cada programa de consola que lance (uwfmgr, schtasks,
+    powershell, shutdown) haria parpadear una ventana negra, y sus descriptores estandar no
+    son validos, asi que un hijo que los herede puede fallar de forma dificil de reproducir.
+    """
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0x08000000) if os.name == 'nt' else 0
+    return {'stdin': subprocess.DEVNULL, 'creationflags': flags}
 
 def inicializar_carpeta():
     """Crea C:\\ProgramData\\UWF-Aulas si todavia no existe."""
@@ -182,8 +212,9 @@ def leer_estado():
     return None
 
 
-def guardar_estado(fase, detalle=''):
-    """Escribe estado.json con la fase actual, o lo borra si fase es None/vacio."""
+def guardar_estado(fase, detalle='', intentos=0):
+    """Escribe estado.json con la fase actual, o lo borra si fase es None/vacio.
+    'intentos' cuenta los reintentos del vigilante para reactivar el filtro."""
     inicializar_carpeta()
     if not fase:
         try:
@@ -197,6 +228,7 @@ def guardar_estado(fase, detalle=''):
         'tecnico': os.environ.get('USERNAME', ''),
         'equipo':  os.environ.get('COMPUTERNAME', socket.gethostname()),
         'detalle': detalle,
+        'intentos': int(intentos),
     }
     with open(EstadoPath, 'w', encoding='utf-8') as fh:
         json.dump(datos, fh, indent=2, ensure_ascii=True)
@@ -223,9 +255,12 @@ def invoke_uwf(argumentos):
     if not test_uwf_instalado():
         raise RuntimeError('uwfmgr.exe no esta disponible. Instala primero la caracteristica UWF.')
     try:
+        # errors='replace': uwfmgr escribe en la pagina OEM de la consola y algunos de sus
+        # bytes no existen en la ANSI; sin esto, un mensaje con tildes hacia fallar la
+        # decodificacion y una orden que habia funcionado se daba por fallida.
         proc = subprocess.run(
             [Uwfmgr] + [str(a) for a in argumentos],
-            capture_output=True, text=True, shell=False,
+            capture_output=True, text=True, shell=False, errors='replace', **_sin_ventana()
         )
         salida = ((proc.stdout or '') + (proc.stderr or '')).strip()
         return {'Codigo': proc.returncode, 'Salida': salida, 'Ok': proc.returncode == 0}
@@ -388,9 +423,10 @@ def aplicar_overlay(tipo, tamano_mb, aviso_mb, critico_mb, filtro_activo):
 
 def normalizar_clave_registro(clave):
     """Convierte HKEY_LOCAL_MACHINE\\... o HKLM:\\... al formato canonico HKLM\\..."""
+    # Sin distinguir mayusculas, como el -replace del .ps1
     c = clave.strip().rstrip('\\')
-    c = re.sub(r'^HKEY_LOCAL_MACHINE', 'HKLM', c)
-    c = re.sub(r'^HKLM:', 'HKLM', c)
+    c = re.sub(r'^HKEY_LOCAL_MACHINE', 'HKLM', c, flags=re.IGNORECASE)
+    c = re.sub(r'^HKLM:?(?=\\|$)', 'HKLM', c, flags=re.IGNORECASE)
     return c
 
 
@@ -429,6 +465,58 @@ def get_exclusiones_registro():
     except Exception:
         pass
     return lista
+
+
+def get_exclusiones_detalle():
+    """Exclusiones ya permitidas en el equipo, separando la sesion actual de la siguiente.
+
+    Devuelve una lista de dicts {Tipo ('archivo'|'registro'), Valor, Ahora, TrasReinicio}:
+    'Ahora' = surte efecto en esta sesion; 'TrasReinicio' = seguira (o empezara) a surtir
+    efecto despues de reiniciar. Una exclusion anadida con el filtro activo solo aparece en
+    la siguiente sesion, y una quitada sigue en la actual hasta reiniciar: mostrarlo evita
+    que el tecnico crea que algo ya funciona cuando aun no.
+
+    Se lee por WMI (UWF_Volume y UWF_RegistryFilter, una instancia por sesion), que no
+    depende del idioma. Si WMI falla, se recurre a uwfmgr sin distinguir sesiones.
+    """
+    def clave_reg(k):
+        c = normalizar_clave_registro(k)
+        return c if re.match(r'^HKLM\\', c, re.IGNORECASE) else 'HKLM\\' + c.lstrip('\\')
+
+    vistas = {}   # (tipo, valor en minusculas) -> dict
+
+    def anotar(tipo, valor, actual):
+        d = vistas.setdefault((tipo, valor.lower()),
+                              {'Tipo': tipo, 'Valor': valor, 'Ahora': False, 'TrasReinicio': False})
+        d['Ahora' if actual else 'TrasReinicio'] = True
+
+    conn = _wmi_embedded()
+    try:
+        if conn is None:
+            raise RuntimeError('WMI no disponible')
+        for v in (conn.UWF_Volume() or []):
+            if str(getattr(v, 'DriveLetter', '') or '').upper() != 'C:':
+                continue
+            actual = bool(getattr(v, 'CurrentSession', False))
+            for f in (v.GetExclusions()[0] or []):
+                ruta = str(getattr(f, 'FileName', '') or '').strip()
+                if ruta:
+                    anotar('archivo', 'C:' + ruta if ruta.startswith('\\') else ruta, actual)
+        for rf in (conn.UWF_RegistryFilter() or []):
+            actual = bool(getattr(rf, 'CurrentSession', False))
+            for k in (rf.GetExclusions()[0] or []):
+                clave = str(getattr(k, 'RegistryKey', '') or '').strip()
+                if clave:
+                    anotar('registro', clave_reg(clave), actual)
+        return list(vistas.values())
+    except Exception:
+        vistas.clear()
+
+    for a in get_exclusiones_archivo():
+        anotar('archivo', a, True); anotar('archivo', a, False)
+    for k in get_exclusiones_registro():
+        anotar('registro', k, True); anotar('registro', k, False)
+    return list(vistas.values())
 
 
 def add_exclusion_archivo(ruta):
@@ -814,11 +902,11 @@ def get_propuestas_exclusion(nombre_programa, fabricante):
         terminos = []
         limpio = re.sub(r'[\d\.\(\)]+', ' ', nombre_programa).strip()
         for p in re.split(r'\s+', limpio):
-            if len(p) >= 4:
+            if len(p) >= 4 and p.lower() not in TerminosGenericos:
                 terminos.append(p)
         if fabricante:
             f = re.split(r'[,\s]+', fabricante)[0]
-            if len(f) >= 4 and f not in terminos:
+            if len(f) >= 4 and f.lower() not in TerminosGenericos and f not in terminos:
                 terminos.append(f)
 
         for termino in terminos:
@@ -850,6 +938,9 @@ def get_propuestas_exclusion(nombre_programa, fabricante):
                                 claves.append(clave)
                 finally:
                     winreg.CloseKey(base)
+
+        carpetas = [c for c in carpetas if c.upper().rstrip('\\') not in RaicesSistema]
+        claves = [k for k in claves if k.upper().rstrip('\\') not in RaicesSistema]
 
     return {'Origen': origen, 'Carpetas': carpetas, 'Claves': claves}
 
@@ -992,7 +1083,7 @@ def _detener_tarea():
     """
     try:
         subprocess.run(['schtasks', '/end', '/tn', Tarea],
-                       capture_output=True, text=True, shell=False)
+                       capture_output=True, text=True, shell=False, **_sin_ventana())
     except Exception:
         pass
 
@@ -1091,7 +1182,7 @@ def instalar_vigilante():
         "Register-ScheduledTask -TaskName '%s' -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null"
     ) % (ejecutable, argumento, Tarea)
     subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                   capture_output=True, text=True, shell=False, check=True)
+                   capture_output=True, text=True, shell=False, check=True, **_sin_ventana())
     escribir_log('InstalarVigilante', 'OK', ScriptDest)
 
 
@@ -1115,7 +1206,7 @@ def crear_acceso_directo():
             "$lnk.Save()"
         ) % (destino, objetivo, argumentos, Base, icono)
         subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                       capture_output=True, text=True, shell=False)
+                       capture_output=True, text=True, shell=False, **_sin_ventana())
     except Exception:
         pass
 
@@ -1162,7 +1253,8 @@ def reiniciar_equipo(motivo):
     """Programa un reinicio en 10 segundos y lo deja anotado en el log."""
     escribir_log('Reinicio', 'OK', motivo)
     try:
-        subprocess.Popen(['shutdown.exe', '/r', '/t', '10', '/c', 'UWF Aulas: %s' % motivo])
+        subprocess.Popen(['shutdown.exe', '/r', '/t', '10', '/c', 'UWF Aulas: %s' % motivo],
+                         **_sin_ventana())
     except Exception as ex:
         escribir_log('Reinicio', 'ERROR', str(ex))
 
@@ -1223,12 +1315,29 @@ def ejecutar_vigilante():
             escribir_log('Vigilante', 'OK', 'Mantenimiento cerrado, filtro activo y verificado')
             guardar_estado(None)
         else:
-            escribir_log('Vigilante', 'ERROR', 'El filtro deberia estar activo y no lo esta. Reintentando')
+            # Tope de reintentos: si 'filter enable' no consigue nada, reiniciar sin limite
+            # dejaria el equipo en un bucle de reinicios que solo se arregla yendo al aula.
             try:
-                invoke_uwf(['filter', 'enable'])
+                intentos = int(estado.get('intentos') or 0)
+            except (TypeError, ValueError):
+                intentos = 0
+            if intentos >= MaxReintentosFiltro:
+                escribir_log('Vigilante', 'ERROR',
+                             'El filtro sigue sin activarse tras %d intentos. No se reinicia mas: '
+                             'hace falta revisar el equipo' % intentos)
+                return
+            escribir_log('Vigilante', 'ERROR',
+                         'El filtro deberia estar activo y no lo esta. Reintento %d de %d'
+                         % (intentos + 1, MaxReintentosFiltro))
+            try:
+                r = invoke_uwf(['filter', 'enable'])
+                if not r['Ok']:
+                    escribir_log('Vigilante', 'ERROR', 'filter enable: %s'
+                                 % ' '.join(r['Salida'].replace(';', ',').split()))
+                guardar_estado('verificando', intentos=intentos + 1)
                 reiniciar_equipo('reactivando proteccion')
-            except Exception:
-                pass
+            except Exception as ex:
+                escribir_log('Vigilante', 'ERROR', str(ex))
     elif fase == 'mantenimiento':
         # Arranque de mantenimiento: se aprovecha que no hay proteccion para volcar la cola.
         # Aqui no se reinicia, porque el tecnico esta trabajando en el equipo.
@@ -1244,10 +1353,19 @@ def ejecutar_vigilante():
             except Exception as ex:
                 escribir_log('Vigilante', 'ERROR', 'Al aplicar la cola en mantenimiento: %s' % ex)
 
-        horas = (datetime.now() - datetime.fromisoformat(estado['inicio'])).total_seconds() / 3600.0
         maximo = 8
-        if cfg.get('horasMaxMantenimiento'):
-            maximo = float(cfg['horasMaxMantenimiento'])
+        try:
+            if cfg.get('horasMaxMantenimiento'):
+                maximo = float(cfg['horasMaxMantenimiento'])
+        except (TypeError, ValueError):
+            pass
+        try:
+            horas = (datetime.now() - datetime.fromisoformat(str(estado['inicio']))).total_seconds() / 3600.0
+        except (KeyError, TypeError, ValueError):
+            # Sin fecha legible no se puede saber cuanto lleva abierto: ante la duda se
+            # protege el equipo, que es el fallo menos grave.
+            escribir_log('Vigilante', 'AVISO', 'estado.json sin fecha de inicio valida')
+            horas = maximo
         if horas >= maximo:
             escribir_log('Vigilante', 'AVISO',
                          'Mantenimiento abierto %.1f h, se reactiva la proteccion automaticamente' % horas)
@@ -1265,15 +1383,125 @@ def ejecutar_vigilante():
 #  Instalar la caracteristica UWF (usado por la GUI)
 # =============================================================================
 
+Caracteristica = 'Client-UnifiedWriteFilter'
+
+
+def _system32():
+    """Carpeta de binarios del sistema correcta para este proceso.
+
+    Un proceso de 32 bits en un Windows de 64 ve 'System32' redirigido a SysWOW64, y DISM no
+    puede trabajar desde ahi: 'Sysnative' es el alias que lleva a los binarios reales de 64
+    bits. Hoy el .exe se compila en 64 bits, pero esto evita un fallo dificil de diagnosticar
+    si algun dia se compila en 32.
+    """
+    raiz = os.environ.get('SystemRoot', r'C:\WINDOWS')
+    if sys.maxsize <= 2 ** 32:
+        nativo = os.path.join(raiz, 'Sysnative')
+        if os.path.isdir(nativo):
+            return nativo
+    return os.path.join(raiz, 'System32')
+
+
+def _ejecutar_oculto(argumentos):
+    """Lanza un proceso hijo sin ventana y sin heredar la entrada estandar.
+
+    Redirigir stdin es imprescindible al correr como .exe empaquetado en modo --windowed: el
+    proceso no tiene consola y sus descriptores estandar no son validos, asi que un hijo que
+    los herede puede fallar de formas que no se reproducen ejecutando el .py desde una
+    terminal. Devuelve (codigo, salida).
+    """
+    proc = subprocess.run(argumentos, capture_output=True, text=True, shell=False,
+                          errors='replace', **_sin_ventana())
+    return proc.returncode, ((proc.stdout or '') + (proc.stderr or '')).strip()
+
+
+def estado_caracteristica_uwf():
+    """Estado de la caracteristica UWF segun DISM, sin depender del idioma del sistema.
+
+    Se fuerza '/English' justo para no parsear texto traducido, igual que el resto del
+    proyecto evita leer la salida localizada de uwfmgr. Devuelve 'Enabled', 'EnablePending',
+    'Disabled', 'NoDisponible' (la edicion de Windows no la incluye) o 'Desconocido'.
+    """
+    dism = os.path.join(_system32(), 'dism.exe')
+    try:
+        codigo, salida = _ejecutar_oculto([dism, '/online', '/get-featureinfo',
+                                           '/featurename:' + Caracteristica, '/english'])
+    except Exception:
+        return 'Desconocido'
+    bajo = salida.lower()
+    if '0x800f080c' in bajo or 'is unknown' in bajo:
+        return 'NoDisponible'
+    m = re.search(r'^\s*State\s*:\s*(\S+)', salida, re.MULTILINE)
+    if m:
+        return m.group(1)
+    return 'Desconocido'
+
+
 def instalar_caracteristica_uwf():
-    """Habilita la caracteristica opcional de Windows Unified Write Filter (requiere reinicio despues)."""
-    ps = ("Enable-WindowsOptionalFeature -Online -FeatureName 'Client-UnifiedWriteFilter' "
-          "-NoRestart -ErrorAction Stop | Out-Null")
-    proc = subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                          capture_output=True, text=True, shell=False)
-    if proc.returncode != 0:
-        raise RuntimeError((proc.stderr or proc.stdout or 'Error al habilitar la caracteristica').strip())
-    escribir_log('InstalarCaracteristica', 'OK')
+    """Habilita la caracteristica opcional Unified Write Filter. Requiere reiniciar despues.
+
+    Dos motores, porque en un equipo gestionado el primero puede no estar disponible:
+      1. dism.exe directamente, que no depende de PowerShell ni de su modo de lenguaje
+         (ConstrainedLanguage o AppLocker pueden bloquear cmdlets sin bloquear dism.exe).
+      2. Enable-WindowsOptionalFeature, como respaldo.
+
+    El resultado se comprueba releyendo el estado, no fiandose del codigo de salida, y se
+    registra SIEMPRE en el log, tambien cuando falla: sin eso, un fallo en un aula no deja
+    rastro con el que diagnosticar. Devuelve el estado final.
+    """
+    previo = estado_caracteristica_uwf()
+    if previo == 'NoDisponible':
+        escribir_log('InstalarCaracteristica', 'ERROR',
+                     'esta edicion de Windows no incluye UWF (%s)' % Caracteristica)
+        raise RuntimeError(
+            'Esta edicion de Windows no incluye el Unified Write Filter.\n\n'
+            'UWF solo esta disponible en Windows 10/11 Enterprise, Education e IoT '
+            'Enterprise. Comprueba la edicion con "winver".')
+    if previo in ('Enabled', 'EnablePending'):
+        escribir_log('InstalarCaracteristica', 'OK', 'ya estaba habilitada: %s' % previo)
+        return previo
+
+    intentos = []
+
+    dism = os.path.join(_system32(), 'dism.exe')
+    try:
+        codigo, salida = _ejecutar_oculto([dism, '/online', '/enable-feature',
+                                           '/featurename:' + Caracteristica,
+                                           '/norestart', '/quiet', '/english'])
+    except Exception as ex:
+        codigo, salida = -1, str(ex)
+    intentos.append(('dism', codigo, salida))
+
+    # 0 = hecho, 3010 = hecho pero pide reinicio
+    if codigo not in (0, 3010):
+        ps = os.path.join(_system32(), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+        orden = ("Enable-WindowsOptionalFeature -Online -FeatureName '%s' -NoRestart "
+                 "-ErrorAction Stop | Out-Null" % Caracteristica)
+        try:
+            codigo2, salida2 = _ejecutar_oculto([ps, '-NoProfile', '-NonInteractive',
+                                                 '-ExecutionPolicy', 'Bypass', '-Command', orden])
+        except Exception as ex:
+            codigo2, salida2 = -1, str(ex)
+        intentos.append(('powershell', codigo2, salida2))
+
+    # Sin ';' en el detalle: es el separador de columnas del log CSV
+    detalle = ' | '.join(
+        '%s codigo=%s %s' % (motor, cod, ' '.join((sal or '').replace(';', ',').split())[:300])
+        for motor, cod, sal in intentos
+    )
+    final = estado_caracteristica_uwf()
+    # Si algun motor dijo que lo hizo pero no se puede releer el estado, se da por bueno
+    if final == 'Desconocido' and any(cod in (0, 3010) for _, cod, _ in intentos):
+        final = 'EnablePending'
+
+    if final in ('Enabled', 'EnablePending'):
+        escribir_log('InstalarCaracteristica', 'OK', 'estado=%s, %s' % (final, detalle))
+        return final
+
+    escribir_log('InstalarCaracteristica', 'ERROR', 'estado=%s, %s' % (final, detalle))
+    raise RuntimeError(
+        'No se ha podido habilitar UWF.\n\nEstado de la caracteristica: %s\n\n%s'
+        % (final, detalle))
 
 
 # =============================================================================
@@ -1330,12 +1558,15 @@ def mostrar_dialogo_programa(padre):
             return
         sel = programas[idx]
         prop = get_propuestas_exclusion(sel['Nombre'], sel['Fabricante'])
+        # Solo se premarca lo del catalogo, que esta verificado; lo de la heuristica es una
+        # busqueda por nombre y el tecnico tiene que elegirlo a conciencia.
+        marcar = 1 if prop['Origen'] == 'catalogo' else 0
         for c in prop['Carpetas']:
-            var = tk.IntVar(value=1)
+            var = tk.IntVar(value=marcar)
             tk.Checkbutton(interior, text='CARPETA  %s' % c, variable=var, anchor='w').pack(fill='x', anchor='w')
             estado['items'].append(('CARPETA', c, var))
         for k in prop['Claves']:
-            var = tk.IntVar(value=1)
+            var = tk.IntVar(value=marcar)
             tk.Checkbutton(interior, text='REGISTRO %s' % k, variable=var, anchor='w').pack(fill='x', anchor='w')
             estado['items'].append(('REGISTRO', k, var))
 
@@ -1349,7 +1580,7 @@ def mostrar_dialogo_programa(padre):
             btn_ok.config(state='normal')
         else:
             lbl_origen.config(text='Programa fuera del catalogo: las rutas son una busqueda automatica por nombre. '
-                                   'Revisalas antes de aceptar.')
+                                   'Marca solo las que sepas que pertenecen a este programa.')
             btn_ok.config(state='normal')
 
     combo.bind('<<ComboboxSelected>>', al_elegir)
@@ -1458,14 +1689,20 @@ def mostrar_interfaz():
     # ========================= PESTANA EXCLUSIONES ===========================
     cols = ('estado', 'tipo', 'ruta', 'existe')
     lv = ttk.Treeview(tab_excl, columns=cols, show='headings')
-    lv.heading('estado', text='Estado'); lv.column('estado', width=150, anchor='w')
+    lbl_resumen_excl = tk.Label(tab_excl, anchor='w', justify='left', font=('Segoe UI', 9, 'bold'))
+    lbl_resumen_excl.place(x=16, y=8, width=880, height=22)
+
+    lv.heading('estado', text='Estado'); lv.column('estado', width=190, anchor='w')
     lv.heading('tipo', text='Tipo'); lv.column('tipo', width=80, anchor='w')
-    lv.heading('ruta', text='Ruta o clave'); lv.column('ruta', width=500, anchor='w')
-    lv.heading('existe', text='Existe'); lv.column('existe', width=140, anchor='w')
+    lv.heading('ruta', text='Ruta o clave'); lv.column('ruta', width=470, anchor='w')
+    lv.heading('existe', text='Existe'); lv.column('existe', width=130, anchor='w')
     lv.tag_configure('noexiste', foreground=ROJO_FILA)
+    lv.tag_configure('permitida', foreground=VERDE)
+    lv.tag_configure('transito', foreground=AMBAR)
+    lv.tag_configure('vacio', foreground=GRIS)
     lv.tag_configure('pend_add', foreground=AZUL)
     lv.tag_configure('pend_del', foreground=ROJO)
-    lv.place(x=16, y=16, width=880, height=380)
+    lv.place(x=16, y=34, width=880, height=362)
 
     btn_add_programa = tk.Button(tab_excl, text='Anadir por programa...', font=('Segoe UI', 9, 'bold'))
     btn_add_programa.place(x=16, y=408, width=170, height=32)
@@ -1489,14 +1726,17 @@ def mostrar_interfaz():
     lbl_aviso.place(x=16, y=448, width=880, height=34)
 
     # ======================== PESTANA USO DEL DISCO ==========================
+    # Sin saltos de linea a mano dentro de cada parrafo: el texto se reparte solo en el ancho
+    # disponible. Con los saltos fijos ocupaba mas de lo que cabe y las dos ultimas lineas
+    # (justo las que explican cuando se puede cambiar el tamano) quedaban tapadas.
     lbl_ov1 = tk.Label(tab_overlay, justify='left', anchor='nw', wraplength=880, text=(
-        'Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al\n'
-        'disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide\n'
+        'Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al '
+        'disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide '
         'cuanto espacio se reserva para eso y donde.\n\n'
         '- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.\n'
         '- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.\n\n'
-        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y\n'
-        'el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se\n'
+        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y '
+        'el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se '
         'abrira la ventana de mantenimiento sola al aplicar.'))
     lbl_ov1.place(x=16, y=16, width=880, height=160)
 
@@ -1665,7 +1905,8 @@ def mostrar_interfaz():
                          'como pendiente, pero no se aplicara hasta instalar la caracteristica.')
 
             # Exclusiones: primero la cola de pendientes, que se ve siempre aunque UWF no este
-            # disponible en este equipo; despues lo que ya esta activo en UWF.
+            # disponible en este equipo; despues lo que ya esta permitido en UWF, distinguiendo
+            # si vale ya o solo tras reiniciar.
             for fila in lv.get_children():
                 lv.delete(fila)
             encolados = set()
@@ -1680,21 +1921,46 @@ def mostrar_interfaz():
                     'si' if existe else 'NO EXISTE - revisar',
                 ), tags=('pend_add' if e['accion'] == 'add' else 'pend_del',))
 
+            n_arch = n_reg = 0
             if u['Instalado']:
-                for a in get_exclusiones_archivo():
-                    if ('archivo', _clave_pendiente('archivo', a)) in encolados:
+                detalle = sorted(get_exclusiones_detalle(),
+                                 key=lambda d: (d['Tipo'] != 'archivo', d['Valor'].lower()))
+                for d in detalle:
+                    if (d['Tipo'], _clave_pendiente(d['Tipo'], d['Valor'])) in encolados:
                         continue
-                    existe = os.path.exists(a)
-                    lv.insert('', 'end',
-                              values=('activa', 'Archivo', a, 'si' if existe else 'NO EXISTE - revisar'),
-                              tags=() if existe else ('noexiste',))
-                for k in get_exclusiones_registro():
-                    if ('registro', _clave_pendiente('registro', k)) in encolados:
-                        continue
-                    existe = existe_clave_hklm(k)
-                    lv.insert('', 'end',
-                              values=('activa', 'Registro', k, 'si' if existe else 'NO EXISTE - revisar'),
-                              tags=() if existe else ('noexiste',))
+                    if d['Ahora'] and d['TrasReinicio']:
+                        texto, tag = 'Permitida', 'permitida'
+                    elif d['TrasReinicio']:
+                        texto, tag = 'Permitida tras reiniciar', 'transito'
+                    else:
+                        texto, tag = 'Se quita al reiniciar', 'transito'
+                    if d['TrasReinicio']:
+                        if d['Tipo'] == 'archivo':
+                            n_arch += 1
+                        else:
+                            n_reg += 1
+                    existe = (os.path.exists(d['Valor']) if d['Tipo'] == 'archivo'
+                              else existe_clave_hklm(d['Valor']))
+                    lv.insert('', 'end', values=(
+                        texto,
+                        'Archivo' if d['Tipo'] == 'archivo' else 'Registro',
+                        d['Valor'],
+                        'si' if existe else 'NO EXISTE - revisar',
+                    ), tags=(tag,) if existe else ('noexiste',))
+
+            if not u['Instalado']:
+                lbl_resumen_excl.config(fg=GRIS,
+                    text='UWF no esta instalado: este equipo no tiene exclusiones permitidas.')
+            elif n_arch or n_reg:
+                lbl_resumen_excl.config(fg=VERDE, text=(
+                    'Permitidas en este equipo: %d carpeta(s)/archivo(s) y %d clave(s) de registro. '
+                    'Todo lo que no aparece aqui se borra al reiniciar.' % (n_arch, n_reg)))
+            else:
+                lbl_resumen_excl.config(fg=AMBAR,
+                    text='Este equipo no tiene ninguna exclusion permitida: todo se borra al reiniciar.')
+            if not lv.get_children():
+                lv.insert('', 'end', values=('', '', '(sin exclusiones ni cambios pendientes)', ''),
+                          tags=('vacio',))
 
             # Barra de cambios pendientes
             if lineas_pend:
@@ -1737,25 +2003,39 @@ def mostrar_interfaz():
             reiniciar_equipo(motivo)
 
     def on_instalar():
-        """Boton 'Instalar caracteristica UWF'."""
+        """Boton 'Instalar caracteristica UWF'. Puede tardar: DISM trabaja sobre la imagen."""
         try:
-            lbl_barra.config(text='Instalando la caracteristica UWF...')
+            lbl_barra.config(text='Instalando la caracteristica UWF (puede tardar un minuto)...')
             form.config(cursor='watch'); form.update_idletasks()
-            instalar_caracteristica_uwf()
+            estado = instalar_caracteristica_uwf()
             form.config(cursor='')
-            preguntar_reinicio('instalacion de la caracteristica UWF')
+            refrescar()
+            if estado == 'Enabled':
+                # Ya activa: no hace falta reiniciar
+                messagebox.showinfo('UWF Aulas', 'La caracteristica UWF ya esta habilitada.')
+            else:
+                preguntar_reinicio('instalacion de la caracteristica UWF')
         except Exception as ex:
             form.config(cursor='')
+            lbl_barra.config(text='No se ha podido instalar la caracteristica UWF')
             messagebox.showerror('Error', str(ex))
 
     def on_preparar():
         """Boton 'Preparar equipo': protege C: con UWF y aplica el perfil de exclusiones guardado."""
         try:
             form.config(cursor='watch'); form.update_idletasks()
-            invoke_uwf(['volume', 'protect', 'C:'])
+            r = invoke_uwf(['volume', 'protect', 'C:'])
+            if not r['Ok']:
+                raise RuntimeError('No se ha podido proteger C: con UWF:\n\n%s' % r['Salida'])
             u = get_estado_uwf()
             errores = aplicar_perfil(leer_perfil(), u['FiltroActual'])
-            invoke_uwf(['filter', 'enable'])
+            r = invoke_uwf(['filter', 'enable'])
+            if not r['Ok']:
+                raise RuntimeError('No se ha podido activar el filtro:\n\n%s' % r['Salida'])
+            # Como cualquier activacion del filtro, el vigilante lo confirma en el arranque
+            guardar_estado('verificando')
+            escribir_log('PrepararEquipo', 'OK' if not errores else 'PARCIAL',
+                         '%d avisos' % len(errores))
             form.config(cursor='')
             refrescar()
             if errores:
@@ -1829,6 +2109,11 @@ def mostrar_interfaz():
             return
         valores = lv.item(sel[0])['values']
         estado_fila, tipo_txt, valor = str(valores[0]), str(valores[1]), str(valores[2])
+        if not tipo_txt:
+            return   # fila informativa de lista vacia
+        if estado_fila == 'Se quita al reiniciar':
+            lbl_barra.config(text='Esa exclusion ya se quitara al reiniciar')
+            return
         tipo = 'archivo' if tipo_txt == 'Archivo' else 'registro'
         try:
             p = leer_pendientes()
@@ -1953,13 +2238,17 @@ def mostrar_interfaz():
                     'version':  _now('%Y-%m-%d'),
                     'archivos': get_exclusiones_archivo(),
                     'registro': get_exclusiones_registro(),
-                    'overlay':  {
+                }
+                # El uso del disco solo se exporta si se ha podido leer entero: con valores a 0
+                # la validacion de umbrales rechazaria el perfil y no se exportaria nada.
+                if (u['OverlayTipo'] in ('RAM', 'Disco') and test_umbrales_validos(
+                        u['OverlayAvisoMB'], u['OverlayCriticoMB'], u['OverlayMaxMB'])):
+                    perfil['overlay'] = {
                         'tipo':      u['OverlayTipo'],
                         'tamanoMB':  u['OverlayMaxMB'],
                         'avisoMB':   u['OverlayAvisoMB'],
                         'criticoMB': u['OverlayCriticoMB'],
-                    },
-                }
+                    }
                 guardar_perfil(perfil, ruta)
                 messagebox.showinfo('UWF Aulas', 'Perfil exportado.')
             except Exception as ex:

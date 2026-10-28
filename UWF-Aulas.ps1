@@ -34,6 +34,7 @@ $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
 $script:Tarea      = 'UWF-Aulas-Vigilante'
+$script:Caracteristica = 'Client-UnifiedWriteFilter'
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
 $script:Prohibidas = @(
@@ -83,6 +84,27 @@ $script:Catalogo = @(
     }
 )
 
+# Palabras que la heuristica de "Anadir por programa" no usa como termino de busqueda: son
+# tan genericas que casarian con medio sistema (p. ej. el fabricante 'Microsoft' proponia
+# excluir HKLM\SOFTWARE\Microsoft entero).
+$script:TerminosGenericos = @(
+    'microsoft', 'windows', 'corporation', 'corp', 'update', 'updates', 'software',
+    'program', 'programs', 'system', 'systems', 'service', 'services', 'driver', 'drivers',
+    'runtime', 'redistributable', 'tools', 'client', 'edition', 'version', 'package',
+    'components', 'framework', 'technologies', 'limited', 'company', 'intel', 'x64-based'
+)
+
+# Carpetas y claves raiz que nunca se proponen por heuristica, aunque casen por nombre
+$script:RaicesSistema = @(
+    'C:\PROGRAMDATA\MICROSOFT',
+    'HKLM\SOFTWARE\MICROSOFT', 'HKLM\SOFTWARE\WOW6432NODE\MICROSOFT',
+    'HKLM\SOFTWARE\CLASSES', 'HKLM\SOFTWARE\WOW6432NODE\CLASSES',
+    'HKLM\SOFTWARE\POLICIES', 'HKLM\SOFTWARE\WOW6432NODE\POLICIES',
+    'HKLM\SOFTWARE\WOW6432NODE', 'HKLM\SOFTWARE\CLIENTS'
+)
+
+$script:MaxReintentosFiltro = 3   # reinicios que el vigilante intenta para reactivar el filtro
+
 # -----------------------------------------------------------------------------
 #  Utilidades
 # -----------------------------------------------------------------------------
@@ -126,7 +148,8 @@ function Leer-Estado {
     return $null
 }
 
-function Guardar-Estado($fase, $detalle = '') {
+function Guardar-Estado($fase, $detalle = '', [int]$intentos = 0) {
+    # 'intentos' cuenta los reintentos del vigilante para reactivar el filtro
     Inicializar-Carpeta
     if (-not $fase) {
         Remove-Item -LiteralPath $script:EstadoPath -Force -ErrorAction SilentlyContinue
@@ -138,6 +161,7 @@ function Guardar-Estado($fase, $detalle = '') {
         tecnico = $env:USERNAME
         equipo  = $env:COMPUTERNAME
         detalle = $detalle
+        intentos = $intentos
     } | ConvertTo-Json | Set-Content -LiteralPath $script:EstadoPath -Encoding UTF8
 }
 
@@ -149,14 +173,25 @@ function Test-Administrador {
 
 function Test-UwfInstalado { Test-Path -LiteralPath $script:Uwfmgr }
 
+function Convertir-SalidaNativa($salida) {
+    # Con '2>&1', cada linea de stderr de un ejecutable llega envuelta en un ErrorRecord que
+    # Out-String pinta con posicion y categoria de PowerShell; aqui se deja solo el texto.
+    return (@($salida | ForEach-Object {
+        if ($_ -is [System.Management.Automation.ErrorRecord]) { $_.Exception.Message } else { "$_" }
+    }) -join "`r`n").Trim()
+}
+
 function Invoke-Uwf {
     param([string[]]$Argumentos)
     if (-not (Test-UwfInstalado)) { throw 'uwfmgr.exe no esta disponible. Instala primero la caracteristica UWF.' }
+    # El script corre con 'Stop': sin esto, una linea de uwfmgr en stderr se convertia en una
+    # excepcion con un mensaje criptico en vez de devolverse como Ok = $false.
+    $ErrorActionPreference = 'Continue'
     $salida = & $script:Uwfmgr @Argumentos 2>&1
     $codigo = $LASTEXITCODE
     [pscustomobject]@{
         Codigo = $codigo
-        Salida = ($salida | Out-String).Trim()
+        Salida = (Convertir-SalidaNativa $salida)
         Ok     = ($codigo -eq 0)
     }
 }
@@ -278,7 +313,7 @@ function Aplicar-Overlay {
 function Normalizar-ClaveRegistro([string]$clave) {
     $c = $clave.Trim().TrimEnd('\')
     $c = $c -replace '^HKEY_LOCAL_MACHINE', 'HKLM'
-    $c = $c -replace '^HKLM:', 'HKLM'
+    $c = $c -replace '^HKLM:?(?=\\|$)', 'HKLM'
     return $c
 }
 
@@ -312,6 +347,58 @@ function Get-ExclusionesRegistro {
         }
     } catch { }
     return $lista
+}
+
+function Get-ExclusionesDetalle {
+    # Exclusiones ya permitidas en el equipo, separando la sesion actual de la siguiente.
+    # Devuelve objetos {Tipo ('archivo'|'registro'), Valor, Ahora, TrasReinicio}: 'Ahora' =
+    # surte efecto en esta sesion; 'TrasReinicio' = seguira (o empezara) a surtir efecto
+    # despues de reiniciar. Una exclusion anadida con el filtro activo solo aparece en la
+    # siguiente sesion, y una quitada sigue en la actual hasta reiniciar: mostrarlo evita que
+    # el tecnico crea que algo ya funciona cuando aun no.
+    #
+    # Se lee por WMI (UWF_Volume y UWF_RegistryFilter, una instancia por sesion), que no
+    # depende del idioma. Si WMI falla, se recurre a uwfmgr sin distinguir sesiones.
+    $vistas = [ordered]@{}
+    $anotar = {
+        param($tipo, $valor, $actual)
+        $k = "$tipo|$($valor.ToLower())"
+        if (-not $vistas.Contains($k)) {
+            $vistas[$k] = [pscustomobject]@{ Tipo = $tipo; Valor = $valor; Ahora = $false; TrasReinicio = $false }
+        }
+        if ($actual) { $vistas[$k].Ahora = $true } else { $vistas[$k].TrasReinicio = $true }
+    }
+
+    try {
+        $ns = 'root\standardcimv2\embedded'
+        foreach ($v in @(Get-CimInstance -Namespace $ns -ClassName UWF_Volume -ErrorAction Stop)) {
+            if ("$($v.DriveLetter)".ToUpper() -ne 'C:') { continue }
+            $res = Invoke-CimMethod -InputObject $v -MethodName GetExclusions -ErrorAction Stop
+            foreach ($f in @($res.ExcludedFiles)) {
+                $ruta = "$($f.FileName)".Trim()
+                if (-not $ruta) { continue }
+                if ($ruta.StartsWith('\')) { $ruta = 'C:' + $ruta }
+                & $anotar 'archivo' $ruta ([bool]$v.CurrentSession)
+            }
+        }
+        foreach ($rf in @(Get-CimInstance -Namespace $ns -ClassName UWF_RegistryFilter -ErrorAction Stop)) {
+            $res = Invoke-CimMethod -InputObject $rf -MethodName GetExclusions -ErrorAction Stop
+            foreach ($k in @($res.ExcludedKeys)) {
+                $clave = "$($k.RegistryKey)".Trim()
+                if (-not $clave) { continue }
+                $clave = Normalizar-ClaveRegistro $clave
+                if ($clave -notmatch '^HKLM\\') { $clave = 'HKLM\' + $clave.TrimStart('\') }
+                & $anotar 'registro' $clave ([bool]$rf.CurrentSession)
+            }
+        }
+        return @($vistas.Values)
+    } catch {
+        $vistas.Clear()
+    }
+
+    foreach ($a in (Get-ExclusionesArchivo))  { & $anotar 'archivo'  $a $true; & $anotar 'archivo'  $a $false }
+    foreach ($k in (Get-ExclusionesRegistro)) { & $anotar 'registro' $k $true; & $anotar 'registro' $k $false }
+    return @($vistas.Values)
 }
 
 function Add-ExclusionArchivo([string]$ruta) {
@@ -628,11 +715,13 @@ function Get-PropuestasExclusion {
         $terminos = New-Object System.Collections.ArrayList
         $limpio = ($NombrePrograma -replace '[\d\.\(\)]+', ' ').Trim()
         foreach ($p in ($limpio -split '\s+')) {
-            if ($p.Length -ge 4) { [void]$terminos.Add($p) }
+            if ($p.Length -ge 4 -and $script:TerminosGenericos -notcontains $p) { [void]$terminos.Add($p) }
         }
         if ($Fabricante) {
             $f = ($Fabricante -split '[,\s]+')[0]
-            if ($f.Length -ge 4 -and $terminos -notcontains $f) { [void]$terminos.Add($f) }
+            if ($f.Length -ge 4 -and $script:TerminosGenericos -notcontains $f -and $terminos -notcontains $f) {
+                [void]$terminos.Add($f)
+            }
         }
 
         foreach ($termino in $terminos) {
@@ -650,6 +739,9 @@ function Get-PropuestasExclusion {
                 }
             }
         }
+
+        $carpetas = @($carpetas | Where-Object { $script:RaicesSistema -notcontains $_.ToUpper().TrimEnd('\') })
+        $claves   = @($claves   | Where-Object { $script:RaicesSistema -notcontains $_.ToUpper().TrimEnd('\') })
     }
 
     [pscustomobject]@{
@@ -925,8 +1017,25 @@ function Ejecutar-Vigilante {
                 Escribir-Log 'Vigilante' 'OK' 'Mantenimiento cerrado, filtro activo y verificado'
                 Guardar-Estado $null
             } else {
-                Escribir-Log 'Vigilante' 'ERROR' 'El filtro deberia estar activo y no lo esta. Reintentando'
-                try { Invoke-Uwf @('filter','enable') | Out-Null; Reiniciar-Equipo 'reactivando proteccion' } catch { }
+                # Tope de reintentos: si 'filter enable' no consigue nada, reiniciar sin limite
+                # dejaria el equipo en un bucle de reinicios que solo se arregla yendo al aula.
+                $intentos = 0
+                try { $intentos = [int]$estado.intentos } catch { }
+                if ($intentos -ge $script:MaxReintentosFiltro) {
+                    Escribir-Log 'Vigilante' 'ERROR' "El filtro sigue sin activarse tras $intentos intentos. No se reinicia mas: hace falta revisar el equipo"
+                    return
+                }
+                Escribir-Log 'Vigilante' 'ERROR' "El filtro deberia estar activo y no lo esta. Reintento $($intentos + 1) de $($script:MaxReintentosFiltro)"
+                try {
+                    $r = Invoke-Uwf @('filter','enable')
+                    if (-not $r.Ok) {
+                        Escribir-Log 'Vigilante' 'ERROR' ("filter enable: " + (($r.Salida -replace ';', ',') -replace '\s+', ' '))
+                    }
+                    Guardar-Estado 'verificando' '' ($intentos + 1)
+                    Reiniciar-Equipo 'reactivando proteccion'
+                } catch {
+                    Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message
+                }
             }
         }
         'mantenimiento' {
@@ -944,9 +1053,16 @@ function Ejecutar-Vigilante {
                 }
             }
 
-            $horas = ((Get-Date) - [datetime]$estado.inicio).TotalHours
-            $max   = 8
-            if ($cfg.horasMaxMantenimiento) { $max = [double]$cfg.horasMaxMantenimiento }
+            $max = 8
+            try { if ($cfg.horasMaxMantenimiento) { $max = [double]$cfg.horasMaxMantenimiento } } catch { }
+            try {
+                $horas = ((Get-Date) - [datetime]$estado.inicio).TotalHours
+            } catch {
+                # Sin fecha legible no se puede saber cuanto lleva abierto: ante la duda se
+                # protege el equipo, que es el fallo menos grave.
+                Escribir-Log 'Vigilante' 'AVISO' 'estado.json sin fecha de inicio valida'
+                $horas = $max
+            }
             if ($horas -ge $max) {
                 Escribir-Log 'Vigilante' 'AVISO' ("Mantenimiento abierto {0:N1} h, se reactiva la proteccion automaticamente" -f $horas)
                 try {
@@ -961,6 +1077,113 @@ function Ejecutar-Vigilante {
             }
         }
     }
+}
+
+# -----------------------------------------------------------------------------
+#  Instalar la caracteristica UWF
+# -----------------------------------------------------------------------------
+function Get-System32 {
+    # Un proceso de 32 bits en un Windows de 64 ve 'System32' redirigido a SysWOW64, y DISM no
+    # puede trabajar desde ahi: 'Sysnative' es el alias que lleva a los binarios reales de 64
+    # bits. PowerShell de 32 bits es posible en equipos gestionados, asi que conviene cubrirlo.
+    $raiz = if ($env:SystemRoot) { $env:SystemRoot } else { 'C:\WINDOWS' }
+    if (-not [Environment]::Is64BitProcess) {
+        $nativo = Join-Path $raiz 'Sysnative'
+        if (Test-Path -LiteralPath $nativo) { return $nativo }
+    }
+    return (Join-Path $raiz 'System32')
+}
+
+function Invoke-Oculto([string]$Ejecutable, [string[]]$Argumentos) {
+    # Devuelve @{ Codigo; Salida }. Dos precauciones de PowerShell 5.1:
+    #  - $ErrorActionPreference local a 'Continue': el script corre con 'Stop' y una simple
+    #    linea en stderr de un ejecutable nativo se convertiria en error terminante.
+    #  - El codigo se lee de $LASTEXITCODE, porque $? no refleja de forma fiable el codigo de
+    #    salida de un ejecutable nativo.
+    $ErrorActionPreference = 'Continue'
+    $salida = ''
+    try {
+        $salida = Convertir-SalidaNativa (& $Ejecutable @Argumentos 2>&1)
+    } catch {
+        return [pscustomobject]@{ Codigo = -1; Salida = $_.Exception.Message }
+    }
+    return [pscustomobject]@{ Codigo = $LASTEXITCODE; Salida = $salida }
+}
+
+function Get-EstadoCaracteristicaUwf {
+    # Estado de la caracteristica UWF segun DISM, sin depender del idioma del sistema: se
+    # fuerza '/English' justo para no parsear texto traducido, igual que el resto del proyecto
+    # evita leer la salida localizada de uwfmgr.
+    # Devuelve 'Enabled', 'EnablePending', 'Disabled', 'NoDisponible' o 'Desconocido'.
+    $dism = Join-Path (Get-System32) 'dism.exe'
+    $r = Invoke-Oculto $dism @('/online','/get-featureinfo',"/featurename:$script:Caracteristica",'/english')
+    $bajo = $r.Salida.ToLower()
+    if ($bajo -match '0x800f080c' -or $bajo -match 'is unknown') { return 'NoDisponible' }
+    $m = [regex]::Match($r.Salida, '(?m)^\s*State\s*:\s*(\S+)')
+    if ($m.Success) { return $m.Groups[1].Value }
+    return 'Desconocido'
+}
+
+function Instalar-CaracteristicaUwf {
+    # Habilita la caracteristica opcional Unified Write Filter. Requiere reiniciar despues.
+    #
+    # Dos motores, porque en un equipo gestionado el primero puede no estar disponible:
+    #   1. dism.exe directamente, que no depende de los cmdlets de PowerShell (AppLocker o el
+    #      modo ConstrainedLanguage pueden bloquearlos sin bloquear dism.exe).
+    #   2. Enable-WindowsOptionalFeature, como respaldo.
+    #
+    # El resultado se comprueba releyendo el estado, no fiandose del codigo de salida, y se
+    # registra SIEMPRE en el log, tambien cuando falla: sin eso, un fallo en un aula no deja
+    # rastro con el que diagnosticar. Devuelve el estado final.
+    $previo = Get-EstadoCaracteristicaUwf
+    if ($previo -eq 'NoDisponible') {
+        Escribir-Log 'InstalarCaracteristica' 'ERROR' "esta edicion de Windows no incluye UWF ($script:Caracteristica)"
+        throw ("Esta edicion de Windows no incluye el Unified Write Filter.`n`n" +
+               'UWF solo esta disponible en Windows 10/11 Enterprise, Education e IoT ' +
+               'Enterprise. Comprueba la edicion con "winver".')
+    }
+    if (@('Enabled','EnablePending') -contains $previo) {
+        Escribir-Log 'InstalarCaracteristica' 'OK' "ya estaba habilitada: $previo"
+        return $previo
+    }
+
+    $intentos = New-Object System.Collections.ArrayList
+
+    # Sin ';' en el detalle: es el separador de columnas del log CSV
+    $resumir = {
+        param($motor, $res)
+        $txt = ($res.Salida -replace ';', ',' -replace '\s+', ' ').Trim()
+        "$motor codigo=$($res.Codigo) $($txt.Substring(0, [Math]::Min(300, $txt.Length)))"
+    }
+    $algunoOk = $false
+
+    $dism = Join-Path (Get-System32) 'dism.exe'
+    $r = Invoke-Oculto $dism @('/online','/enable-feature',"/featurename:$script:Caracteristica",'/norestart','/quiet','/english')
+    [void]$intentos.Add((& $resumir 'dism' $r))
+
+    # 0 = hecho, 3010 = hecho pero pide reinicio
+    if (@(0, 3010) -contains $r.Codigo) {
+        $algunoOk = $true
+    } else {
+        $ps = Join-Path (Get-System32) 'WindowsPowerShell\v1.0\powershell.exe'
+        $orden = "Enable-WindowsOptionalFeature -Online -FeatureName '$script:Caracteristica' -NoRestart -ErrorAction Stop | Out-Null"
+        $r2 = Invoke-Oculto $ps @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$orden)
+        [void]$intentos.Add((& $resumir 'powershell' $r2))
+        if (@(0, 3010) -contains $r2.Codigo) { $algunoOk = $true }
+    }
+
+    $detalle = $intentos -join ' | '
+    $final = Get-EstadoCaracteristicaUwf
+    # Si algun motor dijo que lo hizo pero no se puede releer el estado, se da por bueno
+    if ($final -eq 'Desconocido' -and $algunoOk) { $final = 'EnablePending' }
+
+    if (@('Enabled','EnablePending') -contains $final) {
+        Escribir-Log 'InstalarCaracteristica' 'OK' "estado=$final, $detalle"
+        return $final
+    }
+
+    Escribir-Log 'InstalarCaracteristica' 'ERROR' "estado=$final, $detalle"
+    throw "No se ha podido habilitar UWF.`n`nEstado de la caracteristica: $final`n`n$detalle"
 }
 
 # -----------------------------------------------------------------------------
@@ -1028,8 +1251,11 @@ function Mostrar-DialogoPrograma {
         $sel = $programas[$combo.SelectedIndex]
         $prop = Get-PropuestasExclusion -NombrePrograma $sel.Nombre -Fabricante $sel.Fabricante
 
-        foreach ($c in $prop.Carpetas) { [void]$lista.Items.Add("CARPETA  $c", $true) }
-        foreach ($k in $prop.Claves)   { [void]$lista.Items.Add("REGISTRO $k", $true) }
+        # Solo se premarca lo del catalogo, que esta verificado; lo de la heuristica es una
+        # busqueda por nombre y el tecnico tiene que elegirlo a conciencia.
+        $marcar = ($prop.Origen -eq 'catalogo')
+        foreach ($c in $prop.Carpetas) { [void]$lista.Items.Add("CARPETA  $c", $marcar) }
+        foreach ($k in $prop.Claves)   { [void]$lista.Items.Add("REGISTRO $k", $marcar) }
 
         if ($lista.Items.Count -eq 0) {
             $lblOrigen.Text = 'No se ha encontrado ninguna carpeta ni clave asociada a este programa. Anadela a mano desde la pestana Exclusiones.'
@@ -1037,7 +1263,7 @@ function Mostrar-DialogoPrograma {
             $lblOrigen.Text = 'Programa reconocido: estas rutas son las recomendadas y estan verificadas en este equipo.'
             $btnOk.Enabled = $true
         } else {
-            $lblOrigen.Text = 'Programa fuera del catalogo: las rutas son una busqueda automatica por nombre. Revisalas antes de aceptar.'
+            $lblOrigen.Text = 'Programa fuera del catalogo: las rutas son una busqueda automatica por nombre. Marca solo las que sepas que pertenecen a este programa.'
             $btnOk.Enabled = $true
         }
     })
@@ -1069,7 +1295,7 @@ function Mostrar-Interfaz {
 
     $form                 = New-Object System.Windows.Forms.Form
     $form.Text            = "UWF Aulas v2  -  $env:COMPUTERNAME"
-    $form.Size            = New-Object System.Drawing.Size(940, 700)
+    $form.Size            = New-Object System.Drawing.Size(940, 730)
     $form.StartPosition   = 'CenterScreen'
     $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
     $form.MinimumSize     = New-Object System.Drawing.Size(820, 620)
@@ -1131,6 +1357,8 @@ function Mostrar-Interfaz {
     $btnDescartarPend.Size     = New-Object System.Drawing.Size(110, 34)
     $btnDescartarPend.Anchor   = 'Top,Right'
 
+    # Ancho real antes de meter los botones anclados a la derecha (ver nota mas abajo)
+    $barraPend.Width = $form.ClientSize.Width
     $barraPend.Controls.AddRange(@($lblPend, $btnAplicarPend, $btnDescartarPend))
     $form.Controls.Add($barraPend)
 
@@ -1139,6 +1367,15 @@ function Mostrar-Interfaz {
     # para quedarse con el espacio restante.
     $barra.SendToBack()
     $tabs.BringToFront()
+
+    # Un control anclado abajo o a la derecha calcula su distancia al borde con el tamano que
+    # tiene el contenedor en el momento de anadirlo. Un TabPage recien creado mide 200x100
+    # hasta que la ventana se muestra, asi que al crecer empujaba fuera de la vista todo lo
+    # anclado abajo (los botones de la pestana Exclusiones no se veian). Se fija aqui su
+    # tamano real, antes de colocar nada dentro.
+    $form.PerformLayout()
+    [void]$tabs.Handle
+    foreach ($pg in $tabs.TabPages) { $pg.Bounds = $tabs.DisplayRectangle }
 
     # =========================== PESTANA ESTADO ==============================
     $txtEstado                = New-Object System.Windows.Forms.TextBox
@@ -1176,17 +1413,24 @@ function Mostrar-Interfaz {
     $tabEstado.Controls.AddRange(@($btnInstalar, $btnPreparar, $btnRefrescar))
 
     # ========================= PESTANA EXCLUSIONES ===========================
+    $lblResumenExcl = New-Object System.Windows.Forms.Label
+    $lblResumenExcl.Location = New-Object System.Drawing.Point(16, 8)
+    $lblResumenExcl.Size = New-Object System.Drawing.Size(880, 22)
+    $lblResumenExcl.Anchor = 'Top,Left,Right'
+    $lblResumenExcl.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+    $tabExcl.Controls.Add($lblResumenExcl)
+
     $lv              = New-Object System.Windows.Forms.ListView
     $lv.View         = 'Details'
     $lv.FullRowSelect = $true
     $lv.GridLines    = $true
-    $lv.Location     = New-Object System.Drawing.Point(16, 16)
-    $lv.Size         = New-Object System.Drawing.Size(880, 380)
+    $lv.Location     = New-Object System.Drawing.Point(16, 34)
+    $lv.Size         = New-Object System.Drawing.Size(880, 362)
     $lv.Anchor       = 'Top,Left,Right,Bottom'
-    [void]$lv.Columns.Add('Estado', 150)
+    [void]$lv.Columns.Add('Estado', 190)
     [void]$lv.Columns.Add('Tipo', 80)
-    [void]$lv.Columns.Add('Ruta o clave', 500)
-    [void]$lv.Columns.Add('Existe', 140)
+    [void]$lv.Columns.Add('Ruta o clave', 470)
+    [void]$lv.Columns.Add('Existe', 130)
     $tabExcl.Controls.Add($lv)
 
     $y2 = 408
@@ -1244,18 +1488,13 @@ function Mostrar-Interfaz {
 
     # ======================== PESTANA USO DEL DISCO ==========================
     $lblOv1          = New-Object System.Windows.Forms.Label
-    $lblOv1.Text     = @"
-Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al
-disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide
-cuanto espacio se reserva para eso y donde.
-
-- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.
-- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.
-
-Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y
-el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se
-abrira la ventana de mantenimiento sola al aplicar.
-"@
+    # Sin saltos de linea a mano dentro de cada parrafo: el texto se reparte solo en el ancho
+    # disponible. Con los saltos fijos ocupaba mas de lo que cabe y las dos ultimas lineas
+    # (justo las que explican cuando se puede cambiar el tamano) quedaban tapadas.
+    $lblOv1.Text     = ("Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide cuanto espacio se reserva para eso y donde.`n`n" +
+        "- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.`n" +
+        "- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.`n`n" +
+        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se abrira la ventana de mantenimiento sola al aplicar.')
     $lblOv1.Location = New-Object System.Drawing.Point(16, 16)
     $lblOv1.Size     = New-Object System.Drawing.Size(880, 160)
     $lblOv1.Anchor   = 'Top,Left,Right'
@@ -1501,7 +1740,8 @@ la proteccion por su cuenta en el siguiente arranque.
             }
 
             # Exclusiones: primero la cola de pendientes, que se ve siempre aunque UWF no este
-            # disponible en este equipo; despues lo que ya esta activo en UWF.
+            # disponible en este equipo; despues lo que ya esta permitido en UWF, distinguiendo
+            # si vale ya o solo tras reiniciar.
             $lv.Items.Clear()
             $encolados = New-Object System.Collections.ArrayList
             foreach ($e in @($pend.exclusiones)) {
@@ -1521,34 +1761,52 @@ la proteccion por su cuenta en el siguiente arranque.
                 [void]$encolados.Add("$($e.tipo)|$(Valor-Pendiente $e.tipo $e.valor)")
             }
 
+            $nArch = 0; $nReg = 0
+            $colVerde = [System.Drawing.Color]::FromArgb(30, 120, 60)
+            $colAmbar = [System.Drawing.Color]::FromArgb(150, 80, 0)
+            $colGris  = [System.Drawing.Color]::FromArgb(128, 128, 128)
             if ($u.Instalado) {
-                foreach ($a in (Get-ExclusionesArchivo)) {
-                    if ($encolados -contains "archivo|$(Valor-Pendiente 'archivo' $a)") { continue }
-                    $it = New-Object System.Windows.Forms.ListViewItem('activa')
-                    [void]$it.SubItems.Add('Archivo')
-                    [void]$it.SubItems.Add($a)
-                    if (Test-Path -LiteralPath $a) {
-                        [void]$it.SubItems.Add('si')
-                    } else {
-                        [void]$it.SubItems.Add('NO EXISTE - revisar')
-                        $it.ForeColor = [System.Drawing.Color]::FromArgb(160, 60, 60)
-                    }
-                    [void]$lv.Items.Add($it)
-                }
-                foreach ($k in (Get-ExclusionesRegistro)) {
-                    if ($encolados -contains "registro|$(Valor-Pendiente 'registro' $k)") { continue }
-                    $it = New-Object System.Windows.Forms.ListViewItem('activa')
-                    [void]$it.SubItems.Add('Registro')
-                    [void]$it.SubItems.Add($k)
-                    $ruta = $k -replace '^HKLM\\', 'HKLM:\'
+                $detalle = @(Get-ExclusionesDetalle) | Sort-Object @{ Expression = { $_.Tipo -ne 'archivo' } }, @{ Expression = { $_.Valor.ToLower() } }
+                foreach ($d in $detalle) {
+                    if ($encolados -contains "$($d.Tipo)|$(Valor-Pendiente $d.Tipo $d.Valor)") { continue }
+                    if ($d.Ahora -and $d.TrasReinicio) { $texto = 'Permitida';                $color = $colVerde }
+                    elseif ($d.TrasReinicio)           { $texto = 'Permitida tras reiniciar'; $color = $colAmbar }
+                    else                               { $texto = 'Se quita al reiniciar';    $color = $colAmbar }
+                    if ($d.TrasReinicio) { if ($d.Tipo -eq 'archivo') { $nArch++ } else { $nReg++ } }
+                    $esArchivo = ($d.Tipo -eq 'archivo')
+                    $it = New-Object System.Windows.Forms.ListViewItem($texto)
+                    [void]$it.SubItems.Add($(if ($esArchivo) {'Archivo'} else {'Registro'}))
+                    [void]$it.SubItems.Add($d.Valor)
+                    $ruta = if ($esArchivo) { $d.Valor } else { $d.Valor -replace '^HKLM\\', 'HKLM:\' }
                     if (Test-Path -LiteralPath $ruta) {
                         [void]$it.SubItems.Add('si')
+                        $it.ForeColor = $color
                     } else {
                         [void]$it.SubItems.Add('NO EXISTE - revisar')
                         $it.ForeColor = [System.Drawing.Color]::FromArgb(160, 60, 60)
                     }
                     [void]$lv.Items.Add($it)
                 }
+            }
+
+            if (-not $u.Instalado) {
+                $lblResumenExcl.ForeColor = $colGris
+                $lblResumenExcl.Text = 'UWF no esta instalado: este equipo no tiene exclusiones permitidas.'
+            } elseif ($nArch -or $nReg) {
+                $lblResumenExcl.ForeColor = $colVerde
+                $lblResumenExcl.Text = "Permitidas en este equipo: $nArch carpeta(s)/archivo(s) y $nReg clave(s) de registro. " +
+                                       'Todo lo que no aparece aqui se borra al reiniciar.'
+            } else {
+                $lblResumenExcl.ForeColor = $colAmbar
+                $lblResumenExcl.Text = 'Este equipo no tiene ninguna exclusion permitida: todo se borra al reiniciar.'
+            }
+            if ($lv.Items.Count -eq 0) {
+                $it = New-Object System.Windows.Forms.ListViewItem('')
+                [void]$it.SubItems.Add('')
+                [void]$it.SubItems.Add('(sin exclusiones ni cambios pendientes)')
+                [void]$it.SubItems.Add('')
+                $it.ForeColor = $colGris
+                [void]$lv.Items.Add($it)
             }
 
             # Barra de cambios pendientes
@@ -1591,15 +1849,23 @@ la proteccion por su cuenta en el siguiente arranque.
     $btnRefrescar.Add_Click($refrescar)
 
     $btnInstalar.Add_Click({
+        # Puede tardar: DISM trabaja sobre la imagen del sistema.
         try {
-            $lblBarra.Text = 'Instalando la caracteristica UWF...'
+            $lblBarra.Text = 'Instalando la caracteristica UWF (puede tardar un minuto)...'
             $form.Cursor = 'WaitCursor'
-            Enable-WindowsOptionalFeature -Online -FeatureName 'Client-UnifiedWriteFilter' -NoRestart -ErrorAction Stop | Out-Null
-            Escribir-Log 'InstalarCaracteristica' 'OK'
+            $estado = Instalar-CaracteristicaUwf
             $form.Cursor = 'Default'
-            & $preguntarReinicio 'instalacion de la caracteristica UWF'
+            & $refrescar
+            if ($estado -eq 'Enabled') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    'La caracteristica UWF ya esta habilitada.', 'UWF Aulas', 'OK', 'Information') | Out-Null
+            } else {
+                # Ya activa no hace falta reiniciar; si queda pendiente, si
+                & $preguntarReinicio 'instalacion de la caracteristica UWF'
+            }
         } catch {
             $form.Cursor = 'Default'
+            $lblBarra.Text = 'No se ha podido instalar la caracteristica UWF'
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
         }
     })
@@ -1607,10 +1873,15 @@ la proteccion por su cuenta en el siguiente arranque.
     $btnPreparar.Add_Click({
         try {
             $form.Cursor = 'WaitCursor'
-            Invoke-Uwf @('volume','protect','C:') | Out-Null
+            $r = Invoke-Uwf @('volume','protect','C:')
+            if (-not $r.Ok) { throw "No se ha podido proteger C: con UWF:`n`n$($r.Salida)" }
             $u = Get-EstadoUwf
-            $errores = Aplicar-Perfil (Leer-Perfil) $u.FiltroActual
-            Invoke-Uwf @('filter','enable') | Out-Null
+            $errores = @(Aplicar-Perfil (Leer-Perfil) $u.FiltroActual)
+            $r = Invoke-Uwf @('filter','enable')
+            if (-not $r.Ok) { throw "No se ha podido activar el filtro:`n`n$($r.Salida)" }
+            # Como cualquier activacion del filtro, el vigilante lo confirma en el arranque
+            Guardar-Estado 'verificando'
+            Escribir-Log 'PrepararEquipo' $(if ($errores.Count -eq 0) {'OK'} else {'PARCIAL'}) "$($errores.Count) avisos"
             $form.Cursor = 'Default'
             & $refrescar
             if ($errores.Count) {
@@ -1690,6 +1961,11 @@ la proteccion por su cuenta en el siguiente arranque.
         $estadoFila = $it.SubItems[0].Text
         $tipoTxt    = $it.SubItems[1].Text
         $val        = $it.SubItems[2].Text
+        if (-not $tipoTxt) { return }   # fila informativa de lista vacia
+        if ($estadoFila -eq 'Se quita al reiniciar') {
+            $lblBarra.Text = 'Esa exclusion ya se quitara al reiniciar'
+            return
+        }
         $tipo       = if ($tipoTxt -eq 'Archivo') { 'archivo' } else { 'registro' }
         try {
             $p = Leer-Pendientes
@@ -1816,12 +2092,17 @@ la proteccion por su cuenta en el siguiente arranque.
                     version  = (Get-Date -Format 'yyyy-MM-dd')
                     archivos = @(Get-ExclusionesArchivo)
                     registro = @(Get-ExclusionesRegistro)
-                    overlay  = [pscustomobject]@{
+                }
+                # El uso del disco solo se exporta si se ha podido leer entero: con valores a 0
+                # la validacion de umbrales rechazaria el perfil y no se exportaria nada.
+                if ((@('RAM','Disco') -contains $u.OverlayTipo) -and
+                    (Test-UmbralesValidos $u.OverlayAvisoMB $u.OverlayCriticoMB $u.OverlayMaxMB)) {
+                    $perfil | Add-Member -NotePropertyName overlay -NotePropertyValue ([pscustomobject]@{
                         tipo      = $u.OverlayTipo
                         tamanoMB  = $u.OverlayMaxMB
                         avisoMB   = $u.OverlayAvisoMB
                         criticoMB = $u.OverlayCriticoMB
-                    }
+                    })
                 }
                 Guardar-Perfil $perfil $d.FileName
                 [System.Windows.Forms.MessageBox]::Show('Perfil exportado.', 'UWF Aulas', 'OK', 'Information') | Out-Null
