@@ -10,6 +10,7 @@
 #  Cambios v2:
 #   - Corregidos los umbrales del overlay (aviso < critico) y validacion
 #   - Pestana Uso del disco: tipo (RAM/Disco), tamano y umbrales configurables
+#     (v4: el tamano se elige en GB y los umbrales se calculan solos, ver Get-UmbralesAutomaticos)
 #   - Exclusiones por programa: detecta lo instalado y propone carpetas/claves
 #
 #  Cambios v3:
@@ -260,6 +261,60 @@ function Get-EstadoUwf {
 function Test-UmbralesValidos([int]$aviso, [int]$critico, [int]$tamano) {
     # Ambos miden consumo acumulado: el aviso debe saltar antes que el critico
     return ($aviso -gt 0 -and $critico -gt $aviso -and $tamano -ge $critico)
+}
+
+# Umbrales automaticos: el tecnico solo elige el tamano y los umbrales salen de aqui.
+# Los dos miden cuanto se ha llenado el espacio reservado, asi que el aviso salta antes
+# (75 %) y el critico despues (90 %), dejando siempre al menos 1 GB hasta llenarse del todo.
+# Con el tamano habitual de 32 GB: aviso a 24 GB y critico a 28,8 GB.
+$script:PorcAviso       = 75
+$script:PorcCritico     = 90
+$script:MargenCriticoMB = 1024
+$script:TamanoMinGB     = 2
+$script:TamanoMaxGB     = 512
+$script:TamanoDefGB     = 32
+
+function Get-UmbralesAutomaticos([int]$TamanoMB) {
+    # Devuelve @(avisoMB, criticoMB). Division entera, igual que el '//' del .py.
+    $critico = [Math]::Min([Math]::Floor($TamanoMB * $script:PorcCritico / 100), $TamanoMB - $script:MargenCriticoMB)
+    $aviso   = [Math]::Floor($TamanoMB * $script:PorcAviso / 100)
+    if ($aviso -ge $critico) {    # tamanos pequenos, donde manda el margen de 1 GB
+        $aviso = [Math]::Floor($critico * $script:PorcAviso / $script:PorcCritico)
+    }
+    return @([int]$aviso, [int]$critico)
+}
+
+function Texto-Gb([long]$MB) {
+    # '28,8 GB' a partir de MB, con coma decimal y sin ',0' sobrante
+    $s = ([Math]::Round($MB / 1024.0, 1)).ToString('0.0', [Globalization.CultureInfo]::InvariantCulture).Replace('.', ',')
+    if ($s.EndsWith(',0')) { $s = $s.Substring(0, $s.Length - 2) }
+    return "$s GB"
+}
+
+function Get-EspacioLibreMB([string]$Unidad = 'C') {
+    try { return [long]((Get-PSDrive -Name $Unidad -ErrorAction Stop).Free / 1MB) } catch { return -1 }
+}
+
+function Get-MemoriaFisicaMB {
+    try { return [long]((Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory / 1MB) } catch { return -1 }
+}
+
+function Get-AvisosTamano([string]$Tipo, [int]$TamanoMB) {
+    # Advertencias si el tamano elegido no cabe bien en este equipo (vacia si todo cuadra). No
+    # impide encolar: el tecnico puede estar preparando la cola desde otro equipo.
+    $avisos = New-Object System.Collections.ArrayList
+    if ($Tipo -eq 'Disco') {
+        $libre = Get-EspacioLibreMB
+        if ($libre -ge 0 -and $libre -lt $TamanoMB) {
+            [void]$avisos.Add("El disco C: solo tiene $(Texto-Gb $libre) libres y se van a reservar $(Texto-Gb $TamanoMB).")
+        }
+    } else {
+        $ram = Get-MemoriaFisicaMB
+        if ($ram -gt 0 -and $TamanoMB -gt [Math]::Floor($ram / 2)) {
+            [void]$avisos.Add("El equipo tiene $(Texto-Gb $ram) de RAM: reservar $(Texto-Gb $TamanoMB) en memoria lo dejaria sin memoria al llenarse. Para tamanos asi conviene `"Disco`".")
+        }
+    }
+    return ,$avisos
 }
 
 function Aplicar-TipoTamano([string]$Tipo, [int]$TamanoMB) {
@@ -566,7 +621,7 @@ function Get-ResumenPendientes($p) {
         [void]$lineas.Add("$verbo ${que}: $($e.valor)")
     }
     if ($p.disco) {
-        [void]$lineas.Add("Uso del disco: $($p.disco.tipo), $($p.disco.tamanoMB) MB (aviso $($p.disco.avisoMB), critico $($p.disco.criticoMB))")
+        [void]$lineas.Add("Uso del disco: $($p.disco.tipo), $(Texto-Gb $p.disco.tamanoMB) (aviso al llegar a $(Texto-Gb $p.disco.avisoMB), critico a $(Texto-Gb $p.disco.criticoMB))")
     }
     return $lineas
 }
@@ -755,6 +810,7 @@ function Get-PropuestasExclusion {
 #  Perfiles
 # -----------------------------------------------------------------------------
 function Get-PerfilPredeterminado {
+    $umbr = Get-UmbralesAutomaticos ($script:TamanoDefGB * 1024)
     [pscustomobject]@{
         nombre    = 'Aulas UV - base Kaspersky'
         version   = (Get-Date -Format 'yyyy-MM-dd')
@@ -766,7 +822,9 @@ function Get-PerfilPredeterminado {
             'HKLM\SOFTWARE\WOW6432Node\KasperskyLab',
             'HKLM\SOFTWARE\KasperskyLab'
         )
-        overlay   = [pscustomobject]@{ tipo = 'Disco'; tamanoMB = 4096; avisoMB = 2560; criticoMB = 3584 }
+        # 32 GB en disco con los umbrales automaticos
+        overlay   = [pscustomobject]@{ tipo = 'Disco'; tamanoMB = ($script:TamanoDefGB * 1024)
+                                       avisoMB = $umbr[0]; criticoMB = $umbr[1] }
     }
 }
 
@@ -1518,7 +1576,9 @@ function Mostrar-Interfaz {
     $gbTipo.Controls.AddRange(@($radDisco, $radRam))
 
     $gbTam           = New-Object System.Windows.Forms.GroupBox
-    $gbTam.Text      = 'Espacio (MB)'
+    # El tecnico elige el tamano en GB; los umbrales se calculan solos (Get-UmbralesAutomaticos)
+    # y se muestran como porcentaje de llenado, que es lo que miden de verdad.
+    $gbTam.Text      = 'Espacio reservado'
     $gbTam.Location  = New-Object System.Drawing.Point(272, 176)
     $gbTam.Size      = New-Object System.Drawing.Size(600, 90)
 
@@ -1528,43 +1588,45 @@ function Mostrar-Interfaz {
     $lblTam.Size     = New-Object System.Drawing.Size(60, 22)
     $numTam          = New-Object System.Windows.Forms.NumericUpDown
     $numTam.Location = New-Object System.Drawing.Point(78, 28)
-    $numTam.Size     = New-Object System.Drawing.Size(90, 24)
-    $numTam.Minimum  = 512
-    $numTam.Maximum  = 65536
-    $numTam.Increment = 512
-    $numTam.Value    = 4096
+    $numTam.Size     = New-Object System.Drawing.Size(70, 24)
+    $numTam.Minimum  = $script:TamanoMinGB
+    $numTam.Maximum  = $script:TamanoMaxGB
+    $numTam.Increment = 1
+    $numTam.Value    = $script:TamanoDefGB
+    $lblGb           = New-Object System.Windows.Forms.Label
+    $lblGb.Text      = 'GB'
+    $lblGb.Location  = New-Object System.Drawing.Point(154, 30)
+    $lblGb.Size      = New-Object System.Drawing.Size(30, 22)
 
-    $lblAv           = New-Object System.Windows.Forms.Label
-    $lblAv.Text      = 'Aviso:'
-    $lblAv.Location  = New-Object System.Drawing.Point(196, 30)
-    $lblAv.Size      = New-Object System.Drawing.Size(48, 22)
-    $numAv           = New-Object System.Windows.Forms.NumericUpDown
-    $numAv.Location  = New-Object System.Drawing.Point(246, 28)
-    $numAv.Size      = New-Object System.Drawing.Size(90, 24)
-    $numAv.Minimum   = 128
-    $numAv.Maximum   = 65536
-    $numAv.Increment = 128
-    $numAv.Value     = 2560
+    $lblUmbrales          = New-Object System.Windows.Forms.Label
+    $lblUmbrales.Location = New-Object System.Drawing.Point(16, 56)
+    $lblUmbrales.Size     = New-Object System.Drawing.Size(570, 30)
+    $lblUmbrales.ForeColor = [System.Drawing.Color]::Gray
 
-    $lblCr           = New-Object System.Windows.Forms.Label
-    $lblCr.Text      = 'Critico:'
-    $lblCr.Location  = New-Object System.Drawing.Point(364, 30)
-    $lblCr.Size      = New-Object System.Drawing.Size(52, 22)
-    $numCr           = New-Object System.Windows.Forms.NumericUpDown
-    $numCr.Location  = New-Object System.Drawing.Point(418, 28)
-    $numCr.Size      = New-Object System.Drawing.Size(90, 24)
-    $numCr.Minimum   = 256
-    $numCr.Maximum   = 65536
-    $numCr.Increment = 128
-    $numCr.Value     = 3584
+    # Sin argumentos muestra los umbrales automaticos del tamano elegido; con ellos, los de la
+    # cola (un perfil importado puede traer otros).
+    $mostrarUmbrales = {
+        param($aviso = $null, $critico = $null, $tam = $null)
+        $origen = 'de la cola de pendientes'
+        if ($null -eq $tam) {
+            $tam = [int]$numTam.Value * 1024
+            $umbr = Get-UmbralesAutomaticos $tam
+            $aviso = $umbr[0]; $critico = $umbr[1]
+            $origen = 'calculados segun el tamano'
+        }
+        $lblUmbrales.Text = ("Aviso al llenarse el {0} % ({1}) y critico al {2} % ({3}), {4}." -f `
+            [int][Math]::Round(100.0 * $aviso / $tam), (Texto-Gb $aviso),
+            [int][Math]::Round(100.0 * $critico / $tam), (Texto-Gb $critico), $origen)
+    }
+    # GB enteros (redondeados y dentro del rango del control) a partir de MB
+    $mbAGb = {
+        param($mb)
+        [Math]::Min([Math]::Max([int][Math]::Round([int]$mb / 1024.0), $script:TamanoMinGB), $script:TamanoMaxGB)
+    }
+    $numTam.Add_ValueChanged({ & $mostrarUmbrales })
+    & $mostrarUmbrales
 
-    $lblRegla          = New-Object System.Windows.Forms.Label
-    $lblRegla.Text     = 'Regla: aviso < critico <= tamano. Ambos miden el consumo acumulado.'
-    $lblRegla.Location = New-Object System.Drawing.Point(16, 58)
-    $lblRegla.Size     = New-Object System.Drawing.Size(560, 22)
-    $lblRegla.ForeColor = [System.Drawing.Color]::Gray
-
-    $gbTam.Controls.AddRange(@($lblTam, $numTam, $lblAv, $numAv, $lblCr, $numCr, $lblRegla))
+    $gbTam.Controls.AddRange(@($lblTam, $numTam, $lblGb, $lblUmbrales))
 
     $btnAplicarOv          = New-Object System.Windows.Forms.Button
     $btnAplicarOv.Text     = 'Anadir a los cambios pendientes'
@@ -1671,10 +1733,11 @@ la proteccion por su cuenta en el siguiente arranque.
             [void]$sb.AppendLine("Filtro (sesion act.): " + $(if ($u.FiltroActual) {'ACTIVO'} else {'DESACTIVADO'}))
             [void]$sb.AppendLine("Filtro (tras reinic): " + $(if ($u.FiltroSiguiente) {'ACTIVO'} else {'DESACTIVADO'}))
             [void]$sb.AppendLine("Volumenes protegidos: " + $(if ($u.VolumenesActual.Count) { $u.VolumenesActual -join ', ' } else {'ninguno'}))
-            [void]$sb.AppendLine("Uso del disco       : $($u.OverlayTipo), maximo $($u.OverlayMaxMB) MB")
-            [void]$sb.AppendLine("Umbrales            : aviso $($u.OverlayAvisoMB) MB, critico $($u.OverlayCriticoMB) MB")
+            [void]$sb.AppendLine("Uso del disco       : $($u.OverlayTipo), maximo $(Texto-Gb $u.OverlayMaxMB)")
+            [void]$sb.AppendLine("Umbrales            : aviso al llegar a $(Texto-Gb $u.OverlayAvisoMB), critico a $(Texto-Gb $u.OverlayCriticoMB)")
             if ($u.OverlayUsoMB -ge 0) {
-                [void]$sb.AppendLine("Espacio consumido   : $($u.OverlayUsoMB) MB")
+                $porc = if ($u.OverlayMaxMB -gt 0) { " ($([Math]::Floor(100 * $u.OverlayUsoMB / $u.OverlayMaxMB)) %)" } else { '' }
+                [void]$sb.AppendLine("Espacio consumido   : $(Texto-Gb $u.OverlayUsoMB)$porc")
             }
             [void]$sb.AppendLine('')
             if ($es) {
@@ -1717,16 +1780,16 @@ la proteccion por su cuenta en el siguiente arranque.
             # (son los que el tecnico acaba de decidir); si no, el estado real del equipo.
             if ($pend.disco) {
                 if ($pend.disco.tipo -eq 'RAM') { $radRam.Checked = $true } else { $radDisco.Checked = $true }
-                $numTam.Value = [Math]::Min([Math]::Max([int]$pend.disco.tamanoMB,  $numTam.Minimum), $numTam.Maximum)
-                $numAv.Value  = [Math]::Min([Math]::Max([int]$pend.disco.avisoMB,   $numAv.Minimum),  $numAv.Maximum)
-                $numCr.Value  = [Math]::Min([Math]::Max([int]$pend.disco.criticoMB, $numCr.Minimum),  $numCr.Maximum)
+                $numTam.Value = & $mbAGb $pend.disco.tamanoMB
+                & $mostrarUmbrales ([int]$pend.disco.avisoMB) ([int]$pend.disco.criticoMB) ([int]$pend.disco.tamanoMB)
                 $lblOvEstado.Text = 'Estos valores estan PENDIENTES: todavia no son los del equipo. Pulsa "Aplicar cambios y reiniciar" abajo para que surtan efecto, o "Descartar" para volver a la configuracion real.'
                 $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(31, 95, 169)
             } elseif ($u.Instalado) {
                 if ($u.OverlayTipo -eq 'RAM') { $radRam.Checked = $true } else { $radDisco.Checked = $true }
-                if ($u.OverlayMaxMB   -ge $numTam.Minimum) { $numTam.Value = [Math]::Min($u.OverlayMaxMB,   $numTam.Maximum) }
-                if ($u.OverlayAvisoMB -ge $numAv.Minimum)  { $numAv.Value  = [Math]::Min($u.OverlayAvisoMB, $numAv.Maximum) }
-                if ($u.OverlayCriticoMB -ge $numCr.Minimum){ $numCr.Value  = [Math]::Min($u.OverlayCriticoMB,$numCr.Maximum) }
+                # Se muestra el tamano real y los umbrales que le corresponderian: al encolar
+                # se aplican los automaticos aunque el equipo tenga ahora otros.
+                if ($u.OverlayMaxMB -gt 0) { $numTam.Value = & $mbAGb $u.OverlayMaxMB }
+                & $mostrarUmbrales
                 if ($u.FiltroActual) {
                     $lblOvEstado.Text = 'La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. Si los cambias, al aplicar se abrira la ventana de mantenimiento sola y el equipo se reiniciara dos veces.'
                     $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(150, 80, 0)
@@ -2113,11 +2176,18 @@ la proteccion por su cuenta en el siguiente arranque.
     $btnAplicarOv.Add_Click({
         try {
             $tipo = if ($radRam.Checked) { 'RAM' } else { 'Disco' }
+            $tam  = [int]$numTam.Value * 1024           # UWF trabaja en MB
+            $umbr = Get-UmbralesAutomaticos $tam
+            $avisos = Get-AvisosTamano $tipo $tam
+            if ($avisos.Count -gt 0) {
+                $r = [System.Windows.Forms.MessageBox]::Show(
+                    (($avisos -join "`n`n") + "`n`nEncolarlo de todas formas?"), 'UWF Aulas', 'YesNo', 'Warning')
+                if ($r -ne 'Yes') { return }
+            }
             $p = Leer-Pendientes
-            Set-PendienteDisco $p $tipo ([int]$numTam.Value) ([int]$numAv.Value) ([int]$numCr.Value)
+            Set-PendienteDisco $p $tipo $tam $umbr[0] $umbr[1]
             Guardar-Pendientes $p
-            Escribir-Log 'EncolarUsoDisco' 'OK' `
-                ("tipo=$tipo tamano=$([int]$numTam.Value) aviso=$([int]$numAv.Value) critico=$([int]$numCr.Value)")
+            Escribir-Log 'EncolarUsoDisco' 'OK' ("tipo=$tipo tamano=$tam aviso=$($umbr[0]) critico=$($umbr[1])")
             & $refrescar
             $lblBarra.Text = 'Uso del disco encolado como pendiente'
         } catch {

@@ -10,6 +10,7 @@ Port a Python del script original UWF-Aulas.ps1 (copia exacta de comportamiento)
 Cambios v2 (heredados del original):
   - Corregidos los umbrales del overlay (aviso < critico) y validacion
   - Pestana Uso del disco: tipo (RAM/Disco), tamano y umbrales configurables
+    (v4: el tamano se elige en GB y los umbrales se calculan solos, ver umbrales_automaticos)
   - Exclusiones por programa: detecta lo instalado y propone carpetas/claves
 
 Cambios v3:
@@ -363,6 +364,82 @@ def test_umbrales_validos(aviso, critico, tamano):
     return aviso > 0 and critico > aviso and tamano >= critico
 
 
+# Umbrales automaticos: el tecnico solo elige el tamano y los umbrales salen de aqui.
+# Los dos miden cuanto se ha llenado el espacio reservado, asi que el aviso salta antes
+# (75 %) y el critico despues (90 %), dejando siempre al menos 1 GB hasta llenarse del todo.
+# Con el tamano habitual de 32 GB: aviso a 24 GB y critico a 28,8 GB.
+PorcAviso, PorcCritico = 75, 90
+MargenCriticoMB = 1024
+TamanoMinGB, TamanoMaxGB, TamanoDefGB = 2, 512, 32
+
+
+def umbrales_automaticos(tamano_mb):
+    """Devuelve (aviso_mb, critico_mb) para un tamano de uso del disco en MB."""
+    t = int(tamano_mb)
+    critico = min(t * PorcCritico // 100, t - MargenCriticoMB)
+    aviso = t * PorcAviso // 100
+    if aviso >= critico:          # tamanos pequenos, donde manda el margen de 1 GB
+        aviso = critico * PorcAviso // PorcCritico
+    return aviso, critico
+
+
+def texto_gb(mb):
+    """'28,8 GB' a partir de MB, con coma decimal y sin ',0' sobrante."""
+    s = ('%.1f' % (int(mb) / 1024.0)).replace('.', ',')
+    if s.endswith(',0'):
+        s = s[:-2]
+    return s + ' GB'
+
+
+def espacio_libre_mb(unidad='C:\\'):
+    """MB libres en la unidad, o -1 si no se puede saber."""
+    try:
+        return int(shutil.disk_usage(unidad).free // (1024 * 1024))
+    except Exception:
+        return -1
+
+
+def memoria_fisica_mb():
+    """MB de memoria RAM del equipo, o -1 si no se puede saber."""
+    if os.name != 'nt':
+        return -1
+    try:
+        import ctypes
+
+        class _Mem(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong),
+                        ('ullTotalPhys', ctypes.c_ulonglong), ('ullAvailPhys', ctypes.c_ulonglong),
+                        ('ullTotalPageFile', ctypes.c_ulonglong), ('ullAvailPageFile', ctypes.c_ulonglong),
+                        ('ullTotalVirtual', ctypes.c_ulonglong), ('ullAvailVirtual', ctypes.c_ulonglong),
+                        ('ullAvailExtendedVirtual', ctypes.c_ulonglong)]
+        m = _Mem()
+        m.dwLength = ctypes.sizeof(_Mem)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            return -1
+        return int(m.ullTotalPhys // (1024 * 1024))
+    except Exception:
+        return -1
+
+
+def avisos_tamano(tipo, tamano_mb):
+    """Lista de advertencias si el tamano elegido no cabe bien en este equipo (vacia si todo
+    cuadra). No impide encolar: el tecnico puede estar preparando la cola desde otro equipo."""
+    avisos = []
+    t = int(tamano_mb)
+    if tipo == 'Disco':
+        libre = espacio_libre_mb()
+        if 0 <= libre < t:
+            avisos.append('El disco C: solo tiene %s libres y se van a reservar %s.'
+                          % (texto_gb(libre), texto_gb(t)))
+    else:
+        ram = memoria_fisica_mb()
+        if ram > 0 and t > ram // 2:
+            avisos.append('El equipo tiene %s de RAM: reservar %s en memoria lo dejaria sin '
+                          'memoria al llenarse. Para tamanos asi conviene "Disco".'
+                          % (texto_gb(ram), texto_gb(t)))
+    return avisos
+
+
 def aplicar_tipo_tamano(tipo, tamano_mb):
     """Aplica tipo (RAM/Disco) y tamano del overlay. UWF solo lo admite con el filtro DESACTIVADO:
     comprobarlo es responsabilidad de quien llama. Devuelve la lista de errores."""
@@ -709,8 +786,9 @@ def resumen_pendientes(p):
         lineas.append('%s %s: %s' % (verbo, que, e['valor']))
     d = p.get('disco')
     if d:
-        lineas.append('Uso del disco: %s, %s MB (aviso %s, critico %s)'
-                      % (d['tipo'], d['tamanoMB'], d['avisoMB'], d['criticoMB']))
+        lineas.append('Uso del disco: %s, %s (aviso al llegar a %s, critico a %s)'
+                      % (d['tipo'], texto_gb(d['tamanoMB']), texto_gb(d['avisoMB']),
+                         texto_gb(d['criticoMB'])))
     return lineas
 
 
@@ -950,13 +1028,15 @@ def get_propuestas_exclusion(nombre_programa, fabricante):
 # =============================================================================
 
 def get_perfil_predeterminado():
-    """Perfil de exclusiones que se usa si no hay ninguno guardado: base Kaspersky, overlay 4 GB en disco."""
+    """Perfil de exclusiones que se usa si no hay ninguno guardado: base Kaspersky, overlay de
+    32 GB en disco con los umbrales automaticos."""
+    aviso, critico = umbrales_automaticos(TamanoDefGB * 1024)
     return {
         'nombre':   'Aulas UV - base Kaspersky',
         'version':  _now('%Y-%m-%d'),
         'archivos': [r'C:\ProgramData\KasperskyLab', r'C:\ProgramData\Kaspersky Lab'],
         'registro': [r'HKLM\SOFTWARE\WOW6432Node\KasperskyLab', r'HKLM\SOFTWARE\KasperskyLab'],
-        'overlay':  {'tipo': 'Disco', 'tamanoMB': 4096, 'avisoMB': 2560, 'criticoMB': 3584},
+        'overlay':  {'tipo': 'Disco', 'tamanoMB': TamanoDefGB * 1024, 'avisoMB': aviso, 'criticoMB': critico},
     }
 
 
@@ -1746,28 +1826,55 @@ def mostrar_interfaz():
     tk.Radiobutton(gb_tipo, text='Disco (C:)  - recomendado', variable=var_tipo, value='Disco', anchor='w').place(x=16, y=6, width=210, height=24)
     tk.Radiobutton(gb_tipo, text='RAM (memoria)', variable=var_tipo, value='RAM', anchor='w').place(x=16, y=34, width=210, height=24)
 
-    gb_tam = tk.LabelFrame(tab_overlay, text='Espacio (MB)')
+    # El tecnico elige el tamano en GB; los umbrales se calculan solos (umbrales_automaticos)
+    # y se muestran como porcentaje de llenado, que es lo que miden de verdad.
+    gb_tam = tk.LabelFrame(tab_overlay, text='Espacio reservado')
     gb_tam.place(x=272, y=176, width=600, height=90)
     tk.Label(gb_tam, text='Tamano:').place(x=16, y=12)
-    num_tam = tk.Spinbox(gb_tam, from_=512, to=65536, increment=512, width=8)
-    num_tam.place(x=78, y=10, width=90, height=24)
-    tk.Label(gb_tam, text='Aviso:').place(x=196, y=12)
-    num_av = tk.Spinbox(gb_tam, from_=128, to=65536, increment=128, width=8)
-    num_av.place(x=246, y=10, width=90, height=24)
-    tk.Label(gb_tam, text='Critico:').place(x=364, y=12)
-    num_cr = tk.Spinbox(gb_tam, from_=256, to=65536, increment=128, width=8)
-    num_cr.place(x=418, y=10, width=90, height=24)
-    tk.Label(gb_tam, fg=GRIS,
-             text='Regla: aviso < critico <= tamano. Ambos miden el consumo acumulado.').place(x=16, y=40)
+    num_tam = tk.Spinbox(gb_tam, from_=TamanoMinGB, to=TamanoMaxGB, increment=1, width=6)
+    num_tam.place(x=78, y=10, width=70, height=24)
+    tk.Label(gb_tam, text='GB').place(x=154, y=12)
+    lbl_umbrales = tk.Label(gb_tam, fg=GRIS, anchor='nw', justify='left', wraplength=570)
+    lbl_umbrales.place(x=16, y=40, width=570, height=28)
 
     def _set_spin(spin, valor):
         """Fija el valor mostrado en un Spinbox."""
         spin.delete(0, 'end')
         spin.insert(0, str(valor))
 
-    _set_spin(num_tam, 4096)
-    _set_spin(num_av, 2560)
-    _set_spin(num_cr, 3584)
+    def _mb_a_gb(mb):
+        """GB enteros (redondeados y dentro del rango del Spinbox) a partir de MB."""
+        return min(max(int(round(int(mb) / 1024.0)), TamanoMinGB), TamanoMaxGB)
+
+    def _gb_elegidos():
+        """Tamano en GB escrito en el Spinbox, o None si no es un numero valido."""
+        try:
+            gb = int(str(num_tam.get()).strip())
+        except ValueError:
+            return None
+        return gb if TamanoMinGB <= gb <= TamanoMaxGB else None
+
+    def _mostrar_umbrales(aviso=None, critico=None, tam=None):
+        """Actualiza el texto de umbrales. Sin argumentos, los automaticos del tamano elegido;
+        con ellos, los de la cola (un perfil importado puede traer otros)."""
+        origen = 'de la cola de pendientes'
+        if tam is None:
+            gb = _gb_elegidos()
+            if gb is None:
+                lbl_umbrales.config(text='Indica un tamano entre %d y %d GB.' % (TamanoMinGB, TamanoMaxGB))
+                return
+            tam = gb * 1024
+            aviso, critico = umbrales_automaticos(tam)
+            origen = 'calculados segun el tamano'
+        lbl_umbrales.config(text=(
+            'Aviso al llenarse el %d %% (%s) y critico al %d %% (%s), %s.'
+            % (int(round(100.0 * aviso / tam)), texto_gb(aviso),
+               int(round(100.0 * critico / tam)), texto_gb(critico), origen)))
+
+    num_tam.config(command=_mostrar_umbrales)
+    num_tam.bind('<KeyRelease>', lambda _e: _mostrar_umbrales())
+    _set_spin(num_tam, TamanoDefGB)
+    _mostrar_umbrales()
 
     btn_aplicar_ov = tk.Button(tab_overlay, text='Anadir a los cambios pendientes',
                                font=('Segoe UI', 9, 'bold'))
@@ -1827,10 +1934,13 @@ def mostrar_interfaz():
             lineas.append('Filtro (sesion act.): %s' % ('ACTIVO' if u['FiltroActual'] else 'DESACTIVADO'))
             lineas.append('Filtro (tras reinic): %s' % ('ACTIVO' if u['FiltroSiguiente'] else 'DESACTIVADO'))
             lineas.append('Volumenes protegidos: %s' % (', '.join(u['VolumenesActual']) if u['VolumenesActual'] else 'ninguno'))
-            lineas.append('Uso del disco       : %s, maximo %s MB' % (u['OverlayTipo'], u['OverlayMaxMB']))
-            lineas.append('Umbrales            : aviso %s MB, critico %s MB' % (u['OverlayAvisoMB'], u['OverlayCriticoMB']))
+            lineas.append('Uso del disco       : %s, maximo %s' % (u['OverlayTipo'], texto_gb(u['OverlayMaxMB'])))
+            lineas.append('Umbrales            : aviso al llegar a %s, critico a %s'
+                          % (texto_gb(u['OverlayAvisoMB']), texto_gb(u['OverlayCriticoMB'])))
             if u['OverlayUsoMB'] >= 0:
-                lineas.append('Espacio consumido   : %s MB' % u['OverlayUsoMB'])
+                lineas.append('Espacio consumido   : %s%s' % (
+                    texto_gb(u['OverlayUsoMB']),
+                    ' (%d %%)' % (100 * u['OverlayUsoMB'] // u['OverlayMaxMB']) if u['OverlayMaxMB'] > 0 else ''))
             lineas.append('')
             if es:
                 lineas.append("Mantenimiento       : fase '%s' iniciada el %s por %s" % (es['fase'], es['inicio'], es['tecnico']))
@@ -1875,21 +1985,19 @@ def mostrar_interfaz():
             if pend.get('disco'):
                 d = pend['disco']
                 var_tipo.set(d['tipo'])
-                _set_spin(num_tam, d['tamanoMB'])
-                _set_spin(num_av, d['avisoMB'])
-                _set_spin(num_cr, d['criticoMB'])
+                _set_spin(num_tam, _mb_a_gb(d['tamanoMB']))
+                _mostrar_umbrales(d['avisoMB'], d['criticoMB'], int(d['tamanoMB']))
                 lbl_ov_estado.config(fg=AZUL,
                     text='Estos valores estan PENDIENTES: todavia no son los del equipo. Pulsa '
                          '"Aplicar cambios y reiniciar" abajo para que surtan efecto, o "Descartar" '
                          'para volver a la configuracion real.')
             elif u['Instalado']:
                 var_tipo.set('RAM' if u['OverlayTipo'] == 'RAM' else 'Disco')
-                if u['OverlayMaxMB'] >= 512:
-                    _set_spin(num_tam, min(u['OverlayMaxMB'], 65536))
-                if u['OverlayAvisoMB'] >= 128:
-                    _set_spin(num_av, min(u['OverlayAvisoMB'], 65536))
-                if u['OverlayCriticoMB'] >= 256:
-                    _set_spin(num_cr, min(u['OverlayCriticoMB'], 65536))
+                # Se muestra el tamano real y los umbrales que le corresponderian: al encolar
+                # se aplican los automaticos aunque el equipo tenga ahora otros.
+                if u['OverlayMaxMB'] > 0:
+                    _set_spin(num_tam, _mb_a_gb(u['OverlayMaxMB']))
+                _mostrar_umbrales()
                 if u['FiltroActual']:
                     lbl_ov_estado.config(fg=AMBAR,
                         text='La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. '
@@ -2258,11 +2366,21 @@ def mostrar_interfaz():
         """Boton 'Anadir a los cambios pendientes' de la pestana Uso del disco."""
         try:
             tipo = 'RAM' if var_tipo.get() == 'RAM' else 'Disco'
+            gb = _gb_elegidos()
+            if gb is None:
+                raise ValueError('El tamano tiene que ser un numero entero de GB entre %d y %d.'
+                                 % (TamanoMinGB, TamanoMaxGB))
+            tam = gb * 1024                         # UWF trabaja en MB
+            aviso, critico = umbrales_automaticos(tam)
+            avisos = avisos_tamano(tipo, tam)
+            if avisos and not messagebox.askyesno(
+                    'UWF Aulas', '\n\n'.join(avisos) + '\n\nEncolarlo de todas formas?'):
+                return
             p = leer_pendientes()
-            fijar_pendiente_disco(p, tipo, int(num_tam.get()), int(num_av.get()), int(num_cr.get()))
+            fijar_pendiente_disco(p, tipo, tam, aviso, critico)
             guardar_pendientes(p)
             escribir_log('EncolarUsoDisco', 'OK', 'tipo=%s tamano=%s aviso=%s critico=%s'
-                         % (tipo, num_tam.get(), num_av.get(), num_cr.get()))
+                         % (tipo, tam, aviso, critico))
             refrescar()
             lbl_barra.config(text='Uso del disco encolado como pendiente')
         except Exception as ex:

@@ -277,10 +277,13 @@ En la interfaz se llama "uso del disco" para que se entienda sin conocer UWF. Po
 
 - **Tipo**: `Disco` (reserva espacio en `C:`; recomendado, no resta memoria) o `RAM` (mas
   rapido, pero consume memoria segun se llena).
-- **Tamano** en MB.
-- **Umbrales** en MB: UWF avisa al llegar al de **aviso** y entra en estado critico al
-  llegar al **critico**. Los dos miden **consumo acumulado**, no espacio libre, y deben
-  cumplir:
+- **Tamano**: el tecnico lo elige en **GB enteros** (de 2 a 512; por defecto 32). El
+  programa lo multiplica por 1024 para pasarselo a UWF, que trabaja en MB.
+- **Umbrales**: **se calculan solos** a partir del tamano; el tecnico no los escribe. UWF
+  avisa al llegar al de **aviso** y entra en estado critico al llegar al **critico**. Los
+  dos miden **cuanto se ha llenado** el espacio reservado, no cuanto queda libre, asi que el
+  aviso es el menor de los dos: salta primero y da tiempo a reaccionar antes del critico.
+  UWF exige:
 
   ```
   0 < aviso < critico <= tamano
@@ -289,7 +292,32 @@ En la interfaz se llama "uso del disco" para que se entienda sin conocer UWF. Po
   Esta regla se valida al encolar, al guardar un perfil y al leer la cola. Tenerlos
   invertidos fue un fallo real en una version anterior.
 
-Los valores por defecto son Disco, 4096 MB, aviso 2560 MB y critico 3584 MB.
+Criterio de los umbrales automaticos (`umbrales_automaticos` / `Get-UmbralesAutomaticos`):
+
+- **critico** = 90 % del tamano, pero dejando siempre al menos **1 GB** hasta llenarse;
+- **aviso** = 75 % del tamano; si con tamanos pequenos quedara igual o por encima del
+  critico, se baja en la misma proporcion (75/90 del critico).
+
+| Tamano | Aviso | Critico | Margen hasta llenarse |
+|---|---|---|---|
+| 4 GB | 2,5 GB (62 %) | 3 GB (75 %) | 1 GB |
+| 8 GB | 6 GB (75 %) | 7 GB (88 %) | 1 GB |
+| 16 GB | 12 GB (75 %) | 14,4 GB (90 %) | 1,6 GB |
+| **32 GB** (habitual) | **24 GB (75 %)** | **28,8 GB (90 %)** | **3,2 GB** |
+| 64 GB | 48 GB (75 %) | 57,6 GB (90 %) | 6,4 GB |
+
+En la pestana se muestran como porcentaje de llenado y en GB. Si la cola trae otros
+umbrales (por ejemplo, de un perfil importado), se muestran esos y se respetan; al volver a
+pulsar *Anadir a los cambios pendientes* se sustituyen por los automaticos.
+
+Antes de encolar se comprueba si el tamano cabe en el equipo, y si no se pide confirmacion
+(no se bloquea, porque la cola puede estar preparandose para otro momento):
+
+- con `Disco`, si `C:` tiene menos espacio libre que el tamano elegido;
+- con `RAM`, si el tamano supera la mitad de la memoria del equipo.
+
+La configuracion por defecto (y la del perfil por defecto) es Disco, 32 GB, aviso 24 GB y
+critico 28,8 GB.
 
 ## 9. Perfiles
 
@@ -302,9 +330,11 @@ uso del disco:
   "version": "2026-10-28",
   "archivos": ["C:\\ProgramData\\Ejemplo"],
   "registro": ["HKLM\\SOFTWARE\\Ejemplo"],
-  "overlay": { "tipo": "Disco", "tamanoMB": 4096, "avisoMB": 2560, "criticoMB": 3584 }
+  "overlay": { "tipo": "Disco", "tamanoMB": 32768, "avisoMB": 24576, "criticoMB": 29491 }
 }
 ```
+
+En los perfiles y en `pendientes.json` los tamanos siguen en MB, que es lo que usa UWF.
 
 - **Perfil activo**: `C:\ProgramData\UWF-Aulas\perfil-exclusiones.json`. Lo usa
   "Preparar equipo".
@@ -334,7 +364,7 @@ La **barra de cambios pendientes**, abajo, muestra lo que hay en la cola y los b
 |---|---|
 | **Estado** | Resumen: caracteristica UWF, filtro ahora y tras reiniciar, volumenes protegidos, uso del disco y su consumo (con barra), fase de mantenimiento y numero de pendientes. Botones *Instalar caracteristica UWF* (solo si no esta), *Preparar equipo* y *Actualizar estado*. |
 | **Exclusiones** | Resumen de lo permitido, lista de exclusiones y pendientes (ver [seccion 7](#7-exclusiones)). Botones *Anadir por programa*, *Carpeta*, *Archivo*, *Clave HKLM*, *Quitar*, *Importar perfil* y *Exportar perfil*. *Quitar* sobre un pendiente lo saca de la cola y sobre una exclusion permitida encola su retirada. |
-| **Uso del disco** | Tipo, tamano y umbrales, y el boton *Anadir a los cambios pendientes*. Si hay un cambio encolado se muestran los valores pendientes, marcados como tales. |
+| **Uso del disco** | Tipo, tamano en GB y, debajo, los umbrales calculados (en % de llenado y en GB), y el boton *Anadir a los cambios pendientes*. Si hay un cambio encolado se muestran los valores pendientes, marcados como tales. |
 | **Mantenimiento** | Explicacion del flujo, botones *1 - Iniciar mantenimiento y reiniciar* (solo con el filtro activo) y *3 - Finalizar, proteger y reiniciar* (solo con el filtro desactivado), y las ultimas 40 lineas del log. Si hay un mantenimiento o una aplicacion de cambios en curso, la interfaz se abre directamente en esta pestana. |
 | **Configuracion** | Ruta de red para el log centralizado, horas maximas de mantenimiento y boton para abrir la carpeta de la herramienta. |
 

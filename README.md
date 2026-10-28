@@ -13,8 +13,10 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 - **Estado**: lee en vivo si UWF esta instalado, si el filtro esta activo, que volumenes
   protege y el consumo del overlay, todo via WMI (`root\standardcimv2\embedded`).
 - **Uso del disco** (el *overlay* de UWF): configura donde se guardan los cambios
-  temporales de cada sesion (RAM o Disco), su tamano y los umbrales de aviso/critico
-  (regla: `aviso < critico <= tamano`, ambos como consumo acumulado, no espacio libre).
+  temporales de cada sesion (RAM o Disco) y su tamano, que se elige en GB (32 GB por
+  defecto). Los umbrales de aviso y critico se calculan solos: aviso al 75 % de llenado y
+  critico al 90 %, con al menos 1 GB de margen (regla de UWF: `aviso < critico <= tamano`,
+  ambos como consumo acumulado, no espacio libre).
   En la interfaz se llama "uso del disco" para que se entienda sin conocer UWF;
   internamente (WMI, `uwfmgr` y las claves de los perfiles JSON) se conserva el termino
   original.
