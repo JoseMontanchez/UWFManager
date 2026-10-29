@@ -4,7 +4,7 @@ Herramienta para gestionar el **Unified Write Filter (UWF)** de Windows. Sustitu
 cubre software de terceros como el antivirus) por una ventana de mantenimiento controlada,
 con una GUI pensada para que un tecnico la use en el aula sin margen de error.
 
-El funcionamiento interno (fases, vigilante, cola de cambios, formatos de los ficheros,
+El funcionamiento interno (mantenimiento, cola de cambios, formatos de los ficheros,
 garantias de seguridad y diagnostico de problemas) esta explicado en
 [docs/FUNCIONAMIENTO.md](docs/FUNCIONAMIENTO.md).
 
@@ -44,18 +44,16 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
   - Encolar lo contrario de lo que ya habia encolado anula ambos cambios, y la cola se
     puede descartar entera sin tocar el equipo.
   - Si algun cambio exige la proteccion desactivada (el tamano o el sitio del uso del
-    disco), la herramienta abre la ventana de mantenimiento sola y el vigilante la cierra
-    tras aplicarlo: dos reinicios sin que el tecnico tenga que hacer nada entre medias.
+    disco), se queda en la cola y se aplica al finalizar un mantenimiento.
+  - La cola sobrevive a los reinicios aunque el filtro este activo: la herramienta lleva sus
+    ficheros al disco real con `uwfmgr file commit`.
 - **Mantenimiento**: flujo guiado de 3 pasos para actualizar el equipo sin servicing mode:
   1. Iniciar mantenimiento -> desactiva el filtro y reinicia.
   2. El equipo arranca sin proteccion: se actualiza lo que haga falta.
-  3. Finalizar y proteger -> reactiva el filtro y reinicia.
-- **Vigilante**: una tarea programada (ejecutada como `SYSTEM` en cada arranque) vigila que
-  la proteccion vuelva a activarse tras un mantenimiento y, si alguien se olvida de
-  cerrarlo, reactiva la proteccion sola pasadas unas horas configurables (si el filtro no
-  vuelve, lo reintenta como mucho tres reinicios para no entrar en bucle). Tambien es quien
-  aplica los cambios pendientes en los arranques sin proteccion, y reactiva el filtro
-  aunque la aplicacion falle: el equipo no se queda desprotegido.
+  3. Finalizar y proteger -> aplica los cambios pendientes, reactiva el filtro y reinicia.
+
+  La proteccion **no vuelve sola**: hasta pulsar *Finalizar*, el equipo sigue sin proteger y
+  la interfaz lo avisa en rojo. No hay ningun proceso en segundo plano.
 - **Registro**: cada accion queda en un log CSV local (`C:\ProgramData\UWF-Aulas\uwf-aulas.log`)
   y, si se configura una ruta de red, tambien en un log centralizado por mes.
 
@@ -73,8 +71,7 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 | `.claude/agents/` | Agentes de Claude Code del proyecto: paridad entre las dos implementaciones, revision de los invariantes de UWF, catalogo de exclusiones y empaquetado. |
 
 Estado que la herramienta guarda en el equipo, en `C:\ProgramData\UWF-Aulas\`:
-`config.json` (ruta del log de red y horas maximas de mantenimiento), `estado.json` (fase
-en curso), `perfil-exclusiones.json` (perfil del centro), `pendientes.json` (cola de
+`config.json` (ruta del log de red), `perfil-exclusiones.json` (perfil del centro), `pendientes.json` (cola de
 cambios sin aplicar) y `uwf-aulas.log`.
 
 ## Uso
@@ -82,16 +79,16 @@ cambios sin aplicar) y `uwf-aulas.log`.
 - **Modo normal** (sin argumentos): abre la GUI. Pide privilegios de administrador y, cada vez
   que se ejecuta, se asegura de que el equipo tiene esta version instalada:
   - Se copia a `C:\ProgramData\UWF-Aulas\`.
-  - Registra la tarea programada `UWF-Aulas-Vigilante` (arranque, como `SYSTEM`).
+  - Borra la tarea programada `UWF-Aulas-Vigilante` que registraban las versiones
+    anteriores, si existe.
   - Crea el acceso directo `UWF Aulas.lnk` en el escritorio publico.
 - **Actualizar un equipo** es, por tanto, solo ejecutar la version nueva: compara por hash la
   copia instalada con la que se esta ejecutando y la sustituye si difieren. Como Windows no
-  deja sobrescribir un ejecutable en uso, si el vigilante lo tiene abierto termina su tarea y
-  reintenta, y en ultimo caso aparta el anterior a un `.old-<fecha>` que borra en el arranque
-  siguiente. Si aun asi no pudiera sustituirlo, **avisa al tecnico**: una interfaz nueva con
-  un vigilante antiguo no sabria cerrar la fase de aplicacion de cambios pendientes.
-- **Modo vigilante** (`-Vigilante` / `--vigilante`): sin interfaz, es el que lanza la tarea
-  programada en cada arranque.
+  deja sobrescribir un ejecutable en uso, si esta abierto aparta el anterior a un
+  `.old-<fecha>` que borra en la siguiente ejecucion. Si aun asi no pudiera sustituirlo,
+  **avisa al tecnico**.
+- `-Vigilante` / `--vigilante` ya no hace nada salvo borrar la tarea antigua: solo existe
+  para que la tarea de una version anterior, si reaparece, se elimine sin tocar el filtro.
 
 ## Requisitos
 

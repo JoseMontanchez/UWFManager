@@ -18,8 +18,8 @@ delante del equipo: si el paquete está mal, el fallo se descubre allí, no aqu�
    abrirse. `UWFAulas.bat` lanza el `.py` sin compilar, para desarrollo.
 
 En ambos casos, la primera ejecución en un equipo **se autoinstala**: se copia a
-`C:\ProgramData\UWF-Aulas\`, registra la tarea programada `UWF-Aulas-Vigilante`
-(arranque, como SYSTEM) y crea `UWF Aulas.lnk` en el escritorio público.
+`C:\ProgramData\UWF-Aulas\`, borra la tarea `UWF-Aulas-Vigilante` de versiones
+anteriores si existe y crea `UWF Aulas.lnk` en el escritorio público.
 
 ## Compilar
 

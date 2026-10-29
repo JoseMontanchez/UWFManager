@@ -4,8 +4,9 @@
 
 # =============================================================================
 #  UWF Aulas v2 - gestion del Unified Write Filter para las aulas de la UV
-#  Modo normal    : interfaz grafica para el tecnico
-#  Modo Vigilante : sin interfaz, lo lanza una tarea programada en cada arranque
+#  Interfaz grafica para el tecnico. No hay ningun proceso en segundo plano: la
+#  proteccion solo se desactiva y se reactiva cuando el tecnico lo pide.
+#  (-Vigilante solo existe para borrar la tarea de arranque de versiones anteriores.)
 #
 #  Cambios v2:
 #   - Corregidos los umbrales del overlay (aviso < critico) y validacion
@@ -17,9 +18,8 @@
 #   - Cola de cambios pendientes (pendientes.json): la GUI encola exclusiones y uso
 #     del disco, y nada llega a UWF hasta pulsar "Aplicar cambios y reiniciar". La
 #     lista se ve aunque UWF no este disponible en el equipo.
-#   - Fase 'aplicando': si un pendiente exige el filtro desactivado (tipo o tamano),
-#     la herramienta abre la ventana de mantenimiento sola y el vigilante la cierra
-#     tras aplicar la cola, volviendo a proteger el equipo.
+#   - Lo que exige el filtro desactivado (tipo o tamano del uso del disco) se queda
+#     en la cola hasta que el tecnico pulsa "Finalizar" durante un mantenimiento.
 #   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
 #     claves de los perfiles JSON) se conserva el termino de UWF.
 # =============================================================================
@@ -34,7 +34,7 @@ $script:PendPath   = Join-Path $script:Base 'pendientes.json'
 $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
-$script:Tarea      = 'UWF-Aulas-Vigilante'
+$script:TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
 $script:Caracteristica = 'Client-UnifiedWriteFilter'
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
@@ -104,8 +104,6 @@ $script:RaicesSistema = @(
     'HKLM\SOFTWARE\WOW6432NODE', 'HKLM\SOFTWARE\CLIENTS'
 )
 
-$script:MaxReintentosFiltro = 3   # reinicios que el vigilante intenta para reactivar el filtro
-
 # -----------------------------------------------------------------------------
 #  Utilidades
 # -----------------------------------------------------------------------------
@@ -134,36 +132,13 @@ function Leer-Config {
     if (Test-Path -LiteralPath $script:CfgPath) {
         try { return (Get-Content -LiteralPath $script:CfgPath -Raw | ConvertFrom-Json) } catch { }
     }
-    return [pscustomobject]@{ rutaLogRed = ''; horasMaxMantenimiento = 8 }
+    return [pscustomobject]@{ rutaLogRed = '' }
 }
 
 function Guardar-Config($cfg) {
     Inicializar-Carpeta
     $cfg | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:CfgPath -Encoding UTF8
-}
-
-function Leer-Estado {
-    if (Test-Path -LiteralPath $script:EstadoPath) {
-        try { return (Get-Content -LiteralPath $script:EstadoPath -Raw | ConvertFrom-Json) } catch { }
-    }
-    return $null
-}
-
-function Guardar-Estado($fase, $detalle = '', [int]$intentos = 0) {
-    # 'intentos' cuenta los reintentos del vigilante para reactivar el filtro
-    Inicializar-Carpeta
-    if (-not $fase) {
-        Remove-Item -LiteralPath $script:EstadoPath -Force -ErrorAction SilentlyContinue
-        return
-    }
-    [pscustomobject]@{
-        fase    = $fase
-        inicio  = (Get-Date).ToString('s')
-        tecnico = $env:USERNAME
-        equipo  = $env:COMPUTERNAME
-        detalle = $detalle
-        intentos = $intentos
-    } | ConvertTo-Json | Set-Content -LiteralPath $script:EstadoPath -Encoding UTF8
+    Persistir-EnDisco $script:CfgPath
 }
 
 function Test-Administrador {
@@ -194,6 +169,29 @@ function Invoke-Uwf {
         Codigo = $codigo
         Salida = (Convertir-SalidaNativa $salida)
         Ok     = ($codigo -eq 0)
+    }
+}
+
+function Test-FiltroActivoAhora {
+    # True si el filtro protege la sesion actual. Consulta ligera, sin la foto completa de
+    # Get-EstadoUwf.
+    if (-not (Test-UwfInstalado)) { return $false }
+    try {
+        $f = Get-CimInstance -Namespace 'root\standardcimv2\embedded' -ClassName UWF_Filter -ErrorAction Stop
+        return [bool]$f.CurrentEnabled
+    } catch { return $false }
+}
+
+function Persistir-EnDisco([string]$Ruta, [switch]$Borrado) {
+    # Lleva al disco real un fichero de la herramienta escrito (o borrado) con la proteccion
+    # activa. Sin esto se quedaba en el overlay y desaparecia al reiniciar: por ejemplo, la
+    # cola de pendientes no sobrevivia al reinicio que abre el mantenimiento. Con el filtro
+    # desactivado no hace falta, porque ya se escribe directamente en el disco.
+    if (-not (Test-FiltroActivoAhora)) { return }
+    $orden = if ($Borrado) { 'commit-delete' } else { 'commit' }
+    $r = Invoke-Uwf @('file', $orden, $Ruta)
+    if (-not $r.Ok) {
+        Escribir-Log 'PersistirFichero' 'ERROR' ("{0}: {1}" -f $Ruta, (($r.Salida -replace ';', ',') -replace '\s+', ' '))
     }
 }
 
@@ -490,8 +488,8 @@ function Remove-ExclusionRegistro([string]$clave) {
 #  El tecnico encola en pendientes.json todo lo que quiere cambiar (exclusiones y uso
 #  del disco) y lo aplica de una vez con "Aplicar cambios y reiniciar". Dos razones:
 #  la GUI puede mostrar lo decidido aunque UWF no este disponible todavia en el equipo,
-#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola para
-#  aplicarse en el arranque siguiente.
+#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola hasta
+#  que se pueda (lo que exige el filtro desactivado, al finalizar un mantenimiento).
 # -----------------------------------------------------------------------------
 function Nueva-ColaPendientes {
     return [pscustomobject]@{
@@ -539,7 +537,10 @@ function Leer-Pendientes {
 function Guardar-Pendientes($p) {
     Inicializar-Carpeta
     if (Test-PendientesVacios $p) {
-        Remove-Item -LiteralPath $script:PendPath -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $script:PendPath) {
+            Remove-Item -LiteralPath $script:PendPath -Force -ErrorAction SilentlyContinue
+            Persistir-EnDisco $script:PendPath -Borrado
+        }
         return
     }
     [pscustomobject]@{
@@ -550,6 +551,7 @@ function Guardar-Pendientes($p) {
         exclusiones = @($p.exclusiones)
         disco       = $p.disco
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:PendPath -Encoding UTF8
+    Persistir-EnDisco $script:PendPath
 }
 
 function Valor-Pendiente([string]$Tipo, [string]$Valor) {
@@ -630,7 +632,7 @@ function Aplicar-Pendientes([bool]$FiltroActivo) {
     # Aplica todo lo encolado que se pueda aplicar ahora y conserva el resto en la cola.
     # Exclusiones y umbrales se pueden registrar con el filtro activo o no (surten efecto tras
     # reiniciar). El tipo y el tamano exigen el filtro desactivado: con la proteccion activa se
-    # quedan encolados para aplicarse en el arranque de mantenimiento.
+    # quedan encolados hasta que el tecnico finalice un mantenimiento.
     $p = Leer-Pendientes
     $res = [pscustomobject]@{
         Aplicados          = (New-Object System.Collections.ArrayList)
@@ -868,7 +870,7 @@ function Aplicar-Perfil($perfil, [bool]$FiltroActivo = $false) {
 }
 
 # -----------------------------------------------------------------------------
-#  Tarea vigilante y autoinstalacion
+#  Autoinstalacion
 # -----------------------------------------------------------------------------
 function Get-Huella([string]$ruta) {
     # Hash SHA-256 de un fichero. Sirve para saber si la copia instalada es exactamente la
@@ -893,15 +895,28 @@ function Detectar-Instalacion([string]$Origen) {
     return $r
 }
 
-function Detener-Tarea {
-    # Termina la instancia en curso de la tarea del vigilante, si la hay. Hace falta porque el
-    # vigilante arranca con el equipo: si todavia corre, su fichero esta en uso.
-    try { & schtasks.exe /end /tn $script:Tarea 2>&1 | Out-Null } catch { }
+function Eliminar-TareaAntigua {
+    # Borra la tarea de arranque que registraban las versiones anteriores (el vigilante), y
+    # con ella el estado.json que solo usaba esa tarea.
+    #
+    # Con la proteccion activa el borrado se deshace al reiniciar, porque el registro de
+    # tareas tambien esta filtrado. No pasa nada: la tarea vuelve a lanzar la copia instalada,
+    # que ya es esta version, y esta la borra otra vez. En el primer arranque sin proteccion
+    # (un mantenimiento) el borrado queda definitivo.
+    try {
+        if (Get-ScheduledTask -TaskName $script:TareaAntigua -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $script:TareaAntigua -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $script:TareaAntigua -Confirm:$false -ErrorAction Stop
+            Escribir-Log 'EliminarTareaAntigua' 'OK' $script:TareaAntigua
+        }
+    } catch {
+        Escribir-Log 'EliminarTareaAntigua' 'ERROR' ($_.Exception.Message -replace ';', ',')
+    }
+    Remove-Item -LiteralPath $script:EstadoPath -Force -ErrorAction SilentlyContinue
 }
 
 function Limpiar-Restos {
-    # Borra los apartados .old-* de sustituciones anteriores y el .exe suelto que pudiera
-    # haber dejado una instalacion empaquetada cuando ahora se ejecuta el .ps1.
+    # Borra los apartados .old-* de sustituciones anteriores.
     $borrados = New-Object System.Collections.ArrayList
     try {
         foreach ($f in @(Get-ChildItem -LiteralPath $script:Base -File -ErrorAction SilentlyContinue)) {
@@ -909,7 +924,7 @@ function Limpiar-Restos {
                 try {
                     Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
                     [void]$borrados.Add($f.Name)
-                } catch { }   # sigue en uso: se intentara en el proximo arranque
+                } catch { }   # sigue en uso: se intentara en la proxima ejecucion
             }
         }
     } catch { }
@@ -919,16 +934,13 @@ function Limpiar-Restos {
 function Reemplazar-Instalado([string]$Origen) {
     # Sustituye la copia de ProgramData por la version que se esta ejecutando ahora.
     #
-    # Tres intentos, de menos a mas invasivo, porque Windows no permite sobrescribir un
-    # fichero en uso:
-    #   1. Copiar encima.
-    #   2. Terminar la tarea del vigilante (que es quien suele tenerlo abierto) y repetir.
-    #   3. Apartar el instalado a un '.old-<fecha>' y copiar la nueva al lado. Renombrar un
-    #      ejecutable en uso si esta permitido; el .old se borra en la siguiente ejecucion.
+    # Windows no permite sobrescribir un fichero en uso (por ejemplo, otra ventana de la
+    # herramienta abierta desde el acceso directo). Si copiar encima falla, se aparta el
+    # instalado a un '.old-<fecha>' y se copia la nueva al lado; el .old se borra en la
+    # siguiente ejecucion.
     #
-    # Devuelve (Accion, Detalle). Lanza excepcion solo si los tres fallan, para que quien
-    # llama pueda avisar al tecnico: una copia instalada vieja con una GUI nueva es peligrosa,
-    # porque el vigilante antiguo no conoce la fase 'aplicando'.
+    # Devuelve (Accion, Detalle). Lanza excepcion solo si los dos intentos fallan, para que
+    # quien llama pueda avisar al tecnico.
     $previo = Detectar-Instalacion $Origen
 
     if (-not $previo.Existe) {
@@ -946,195 +958,74 @@ function Reemplazar-Instalado([string]$Origen) {
         return @('sustituido', $detalle)
     } catch { }
 
-    Detener-Tarea
-    try {
-        Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force -ErrorAction Stop
-        return @('sustituido', "$detalle (tras detener la tarea)")
-    } catch { }
-
     $apartado = "$($script:ScriptDest).old-$(Get-Date -Format 'yyyyMMddHHmmss')"
     Move-Item -LiteralPath $script:ScriptDest -Destination $apartado -Force -ErrorAction Stop
     Copy-Item -LiteralPath $Origen -Destination $script:ScriptDest -Force
     return @('sustituido', "$detalle (la anterior estaba en uso, apartada como $(Split-Path $apartado -Leaf))")
 }
 
-function Instalar-Vigilante {
-    # Se ejecuta en cada arranque de la GUI, no solo la primera vez, para que actualizar un
-    # equipo sea solo abrir la version nueva.
+function Instalar-Copia {
+    # Deja en ProgramData una copia de esta version, que es a la que apunta el acceso directo,
+    # y borra la tarea de arranque de versiones anteriores. Se ejecuta en cada arranque de la
+    # GUI, no solo la primera vez, para que actualizar un equipo sea solo abrir la version nueva.
     Inicializar-Carpeta
+    Eliminar-TareaAntigua
     $origen = $PSCommandPath
     if ($origen -and ($origen -ne $script:ScriptDest)) {
         $res = Reemplazar-Instalado $origen
         if ($res[0] -ne 'sin cambios') {
+            # Con la proteccion activa la copia nueva se perderia al reiniciar
+            Persistir-EnDisco $script:ScriptDest
             Escribir-Log 'ActualizarInstalacion' 'OK' "$($res[0]): $($res[1])"
         }
         $restos = @(Limpiar-Restos)
         if ($restos.Count) { Escribir-Log 'LimpiarRestos' 'OK' ($restos -join ', ') }
     }
-    $accion   = New-ScheduledTaskAction -Execute 'powershell.exe' `
-                -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Vigilante' -f $script:ScriptDest)
-    $trigger  = New-ScheduledTaskTrigger -AtStartup
-    $ppal     = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $opciones = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-    Register-ScheduledTask -TaskName $script:Tarea -Action $accion -Trigger $trigger `
-        -Principal $ppal -Settings $opciones -Force | Out-Null
-    Escribir-Log 'InstalarVigilante' 'OK' $script:ScriptDest
 }
 
 function Crear-AccesoDirecto {
     try {
+        $destino = Join-Path (Join-Path $env:PUBLIC 'Desktop') 'UWF Aulas.lnk'
         $ws  = New-Object -ComObject WScript.Shell
-        $lnk = $ws.CreateShortcut((Join-Path (Join-Path $env:PUBLIC 'Desktop') 'UWF Aulas.lnk'))
+        $lnk = $ws.CreateShortcut($destino)
         $lnk.TargetPath       = 'powershell.exe'
         $lnk.Arguments        = ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $script:ScriptDest)
         $lnk.WorkingDirectory = $script:Base
         $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,48"
         $lnk.Description      = 'Gestion del Unified Write Filter'
         $lnk.Save()
+        Persistir-EnDisco $destino
     } catch { }
 }
 
 # -----------------------------------------------------------------------------
 #  Flujo de mantenimiento
+#
+#  Todo lo decide el tecnico: la herramienta no tiene nada corriendo en segundo plano ni
+#  vuelve a proteger el equipo por su cuenta. Mientras el filtro esta desactivado, el
+#  banner de la ventana lo avisa en rojo.
 # -----------------------------------------------------------------------------
 function Iniciar-Mantenimiento {
     $r = Invoke-Uwf @('filter','disable')
     if (-not $r.Ok) { throw "No se ha podido desactivar el filtro: $($r.Salida)" }
-    Guardar-Estado 'mantenimiento'
     Escribir-Log 'IniciarMantenimiento' 'OK' 'filtro desactivado, pendiente de reinicio'
 }
 
-function Iniciar-AplicacionPendientes {
-    # Abre una ventana de mantenimiento automatica, solo para aplicar los pendientes que exigen
-    # el filtro desactivado (tipo y tamano del uso del disco). Se distingue de un mantenimiento
-    # normal por la fase 'aplicando': el vigilante la reconoce en el arranque siguiente, aplica
-    # la cola, vuelve a proteger el equipo y reinicia sin que el tecnico haga nada mas.
-    $r = Invoke-Uwf @('filter','disable')
-    if (-not $r.Ok) { throw "No se ha podido desactivar el filtro: $($r.Salida)" }
-    Guardar-Estado 'aplicando'
-    Escribir-Log 'IniciarAplicacionPendientes' 'OK' 'filtro desactivado para aplicar la cola, pendiente de reinicio'
-}
-
 function Finalizar-Mantenimiento {
+    # Aplica la cola de pendientes y reactiva el filtro. Es el momento de aplicar lo que exige
+    # el filtro desactivado (tipo y tamano del uso del disco). Los fallos de la cola no impiden
+    # proteger el equipo: se devuelven para que la GUI los ensene y lo que falle se queda en
+    # la cola.
+    $res = Aplicar-Pendientes $false
     $r = Invoke-Uwf @('filter','enable')
     if (-not $r.Ok) { throw "No se ha podido activar el filtro: $($r.Salida)" }
-    Guardar-Estado 'verificando'
     Escribir-Log 'FinalizarMantenimiento' 'OK' 'filtro activado, pendiente de reinicio'
+    return $res
 }
 
 function Reiniciar-Equipo([string]$motivo) {
     Escribir-Log 'Reinicio' 'OK' $motivo
     Start-Process -FilePath 'shutdown.exe' -ArgumentList '/r','/t','10','/c',"UWF Aulas: $motivo" -WindowStyle Hidden
-}
-
-# -----------------------------------------------------------------------------
-#  MODO VIGILANTE (sin interfaz, en cada arranque)
-# -----------------------------------------------------------------------------
-function Ejecutar-Vigilante {
-    $estado = Leer-Estado
-    $cfg    = Leer-Config
-    $uwf    = Get-EstadoUwf
-
-    if (-not $estado) {
-        if ($uwf.Instalado -and -not $uwf.FiltroActual) {
-            Escribir-Log 'Vigilante' 'AVISO' 'El equipo ha arrancado con el filtro desactivado y sin mantenimiento en curso'
-        }
-        return
-    }
-
-    switch ($estado.fase) {
-        'aplicando' {
-            # El equipo ha arrancado sin proteccion solo para volcar la cola. Pase lo que pase con
-            # los pendientes, el filtro tiene que quedar activo otra vez antes de devolver el
-            # equipo al aula.
-            if ($uwf.FiltroActual) {
-                Escribir-Log 'Vigilante' 'ERROR' 'Se esperaba el filtro desactivado para aplicar la cola; se deja para el tecnico'
-                Guardar-Estado 'verificando'
-                return
-            }
-            try {
-                $res = Aplicar-Pendientes $false
-                Escribir-Log 'Vigilante' `
-                    $(if ($res.Errores.Count -eq 0 -and $res.Restantes -eq 0) {'OK'} else {'PARCIAL'}) `
-                    ("Cola aplicada: $($res.Aplicados.Count) cambios, $($res.Restantes) restantes, $($res.Errores.Count) errores")
-                foreach ($err in $res.Errores) { Escribir-Log 'Vigilante' 'ERROR' $err }
-            } catch {
-                Escribir-Log 'Vigilante' 'ERROR' ("Al aplicar la cola: " + $_.Exception.Message)
-            }
-            try {
-                $r = Invoke-Uwf @('filter','enable')
-                if (-not $r.Ok) { Escribir-Log 'Vigilante' 'ERROR' "No se ha podido reactivar el filtro: $($r.Salida)" }
-                Guardar-Estado 'verificando'
-                Reiniciar-Equipo 'cierre automatico tras aplicar los cambios pendientes'
-            } catch {
-                Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message
-            }
-        }
-        'verificando' {
-            if ($uwf.FiltroActual) {
-                Escribir-Log 'Vigilante' 'OK' 'Mantenimiento cerrado, filtro activo y verificado'
-                Guardar-Estado $null
-            } else {
-                # Tope de reintentos: si 'filter enable' no consigue nada, reiniciar sin limite
-                # dejaria el equipo en un bucle de reinicios que solo se arregla yendo al aula.
-                $intentos = 0
-                try { $intentos = [int]$estado.intentos } catch { }
-                if ($intentos -ge $script:MaxReintentosFiltro) {
-                    Escribir-Log 'Vigilante' 'ERROR' "El filtro sigue sin activarse tras $intentos intentos. No se reinicia mas: hace falta revisar el equipo"
-                    return
-                }
-                Escribir-Log 'Vigilante' 'ERROR' "El filtro deberia estar activo y no lo esta. Reintento $($intentos + 1) de $($script:MaxReintentosFiltro)"
-                try {
-                    $r = Invoke-Uwf @('filter','enable')
-                    if (-not $r.Ok) {
-                        Escribir-Log 'Vigilante' 'ERROR' ("filter enable: " + (($r.Salida -replace ';', ',') -replace '\s+', ' '))
-                    }
-                    Guardar-Estado 'verificando' '' ($intentos + 1)
-                    Reiniciar-Equipo 'reactivando proteccion'
-                } catch {
-                    Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message
-                }
-            }
-        }
-        'mantenimiento' {
-            # Arranque de mantenimiento: se aprovecha que no hay proteccion para volcar la cola.
-            # Aqui no se reinicia, porque el tecnico esta trabajando en el equipo.
-            if (-not $uwf.FiltroActual -and -not (Test-PendientesVacios (Leer-Pendientes))) {
-                try {
-                    $res = Aplicar-Pendientes $false
-                    Escribir-Log 'Vigilante' `
-                        $(if ($res.Errores.Count -eq 0 -and $res.Restantes -eq 0) {'OK'} else {'PARCIAL'}) `
-                        ("Cola aplicada en mantenimiento: $($res.Aplicados.Count) cambios, $($res.Restantes) restantes, $($res.Errores.Count) errores")
-                    foreach ($err in $res.Errores) { Escribir-Log 'Vigilante' 'ERROR' $err }
-                } catch {
-                    Escribir-Log 'Vigilante' 'ERROR' ("Al aplicar la cola en mantenimiento: " + $_.Exception.Message)
-                }
-            }
-
-            $max = 8
-            try { if ($cfg.horasMaxMantenimiento) { $max = [double]$cfg.horasMaxMantenimiento } } catch { }
-            try {
-                $horas = ((Get-Date) - [datetime]$estado.inicio).TotalHours
-            } catch {
-                # Sin fecha legible no se puede saber cuanto lleva abierto: ante la duda se
-                # protege el equipo, que es el fallo menos grave.
-                Escribir-Log 'Vigilante' 'AVISO' 'estado.json sin fecha de inicio valida'
-                $horas = $max
-            }
-            if ($horas -ge $max) {
-                Escribir-Log 'Vigilante' 'AVISO' ("Mantenimiento abierto {0:N1} h, se reactiva la proteccion automaticamente" -f $horas)
-                try {
-                    Invoke-Uwf @('filter','enable') | Out-Null
-                    Guardar-Estado 'verificando'
-                    Reiniciar-Equipo 'cierre automatico de mantenimiento'
-                } catch {
-                    Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message
-                }
-            } else {
-                Escribir-Log 'Vigilante' 'INFO' ("Mantenimiento en curso desde hace {0:N1} h" -f $horas)
-            }
-        }
-    }
 }
 
 # -----------------------------------------------------------------------------
@@ -1552,7 +1443,7 @@ function Mostrar-Interfaz {
     $lblOv1.Text     = ("Mientras la proteccion esta activa, todo lo que el profesor escribe en el equipo no va al disco de verdad: se guarda en un espacio aparte que se vacia al reiniciar. Aqui se decide cuanto espacio se reserva para eso y donde.`n`n" +
         "- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.`n" +
         "- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.`n`n" +
-        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se abrira la ventana de mantenimiento sola al aplicar.')
+        'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y el sitio solo pueden cambiarse con la proteccion desactivada: si la proteccion esta activa, se quedan en la cola hasta que pulses "Finalizar" durante un mantenimiento.')
     $lblOv1.Location = New-Object System.Drawing.Point(16, 16)
     $lblOv1.Size     = New-Object System.Drawing.Size(880, 160)
     $lblOv1.Anchor   = 'Top,Left,Right'
@@ -1652,11 +1543,10 @@ Flujo de mantenimiento (sustituye al servicing mode de UWF):
 
   1. Iniciar mantenimiento    ->  desactiva el filtro y reinicia
   2. El equipo arranca sin proteccion: instala parches, actualiza Kaspersky, cambia lo que necesites
-  3. Finalizar y proteger     ->  reactiva el filtro y reinicia
-  4. Al arrancar, el vigilante comprueba que la proteccion ha vuelto y lo anota en el registro
+  3. Finalizar y proteger     ->  aplica los cambios pendientes, reactiva el filtro y reinicia
 
-Si el mantenimiento se queda abierto mas horas de las configuradas, el vigilante reactiva
-la proteccion por su cuenta en el siguiente arranque.
+La proteccion NO vuelve sola: hasta que pulses "Finalizar", el equipo sigue sin proteger
+en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
 "@
 
     $lblFase           = New-Object System.Windows.Forms.Label
@@ -1696,34 +1586,22 @@ la proteccion por su cuenta en el siguiente arranque.
     $txtRed.Location = New-Object System.Drawing.Point(16, 46)
     $txtRed.Size     = New-Object System.Drawing.Size(600, 24)
 
-    $lblHoras        = New-Object System.Windows.Forms.Label
-    $lblHoras.Text   = 'Horas maximas con el mantenimiento abierto antes de reactivar la proteccion:'
-    $lblHoras.Location = New-Object System.Drawing.Point(16, 86)
-    $lblHoras.Size   = New-Object System.Drawing.Size(500, 22)
-
-    $numHoras        = New-Object System.Windows.Forms.NumericUpDown
-    $numHoras.Location = New-Object System.Drawing.Point(16, 112)
-    $numHoras.Size   = New-Object System.Drawing.Size(80, 24)
-    $numHoras.Minimum = 1
-    $numHoras.Maximum = 72
-
     $btnGuardarCfg   = New-Object System.Windows.Forms.Button
     $btnGuardarCfg.Text = 'Guardar configuracion'
-    $btnGuardarCfg.Location = New-Object System.Drawing.Point(16, 156)
+    $btnGuardarCfg.Location = New-Object System.Drawing.Point(16, 90)
     $btnGuardarCfg.Size = New-Object System.Drawing.Size(200, 34)
 
     $btnAbrirCarpeta = New-Object System.Windows.Forms.Button
     $btnAbrirCarpeta.Text = 'Abrir carpeta de la herramienta'
-    $btnAbrirCarpeta.Location = New-Object System.Drawing.Point(228, 156)
+    $btnAbrirCarpeta.Location = New-Object System.Drawing.Point(228, 90)
     $btnAbrirCarpeta.Size = New-Object System.Drawing.Size(240, 34)
 
-    $tabCfg.Controls.AddRange(@($lblRed, $txtRed, $lblHoras, $numHoras, $btnGuardarCfg, $btnAbrirCarpeta))
+    $tabCfg.Controls.AddRange(@($lblRed, $txtRed, $btnGuardarCfg, $btnAbrirCarpeta))
 
     # ============================ LOGICA GUI =================================
     $refrescar = {
         try {
             $u  = Get-EstadoUwf
-            $es = Leer-Estado
             $pend = Leer-Pendientes
             $lineasPend = @(Get-ResumenPendientes $pend)
 
@@ -1740,8 +1618,8 @@ la proteccion por su cuenta en el siguiente arranque.
                 [void]$sb.AppendLine("Espacio consumido   : $(Texto-Gb $u.OverlayUsoMB)$porc")
             }
             [void]$sb.AppendLine('')
-            if ($es) {
-                [void]$sb.AppendLine("Mantenimiento       : fase '$($es.fase)' iniciada el $($es.inicio) por $($es.tecnico)")
+            if ($u.Instalado -and -not $u.FiltroActual) {
+                [void]$sb.AppendLine('Mantenimiento       : EN CURSO (proteccion desactivada)')
             } else {
                 [void]$sb.AppendLine('Mantenimiento       : ninguno en curso')
             }
@@ -1754,21 +1632,20 @@ la proteccion por su cuenta en el siguiente arranque.
                 $barraOverlay.Value   = [Math]::Min([int]$u.OverlayUsoMB, [int]$u.OverlayMaxMB)
             }
 
-            # Banner
-            $faseAbierta = if ($es) { $es.fase } else { $null }
-            if ((@('mantenimiento','aplicando') -contains $faseAbierta) -and -not $u.FiltroActual) {
-                $banner.BackColor  = [System.Drawing.Color]::FromArgb(178, 34, 34)
-                $lblBanner.Text    = if ($faseAbierta -eq 'aplicando') {
-                    'APLICANDO CAMBIOS PENDIENTES  -  EL EQUIPO NO ESTA PROTEGIDO'
-                } else {
-                    'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO'
-                }
+            # Banner. Nadie reactiva la proteccion por su cuenta, asi que con el filtro
+            # desactivado el aviso es rojo hasta que el tecnico pulse "Finalizar".
+            if (-not $u.Instalado) {
+                $banner.BackColor  = [System.Drawing.Color]::FromArgb(200, 130, 0)
+                $lblBanner.Text    = 'UWF NO ESTA INSTALADO  -  el equipo no esta protegido'
             } elseif ($u.FiltroActual) {
                 $banner.BackColor  = [System.Drawing.Color]::FromArgb(30, 120, 60)
                 $lblBanner.Text    = 'PROTECCION ACTIVA  -  los cambios se descartan al reiniciar'
-            } else {
+            } elseif ($u.FiltroSiguiente) {
                 $banner.BackColor  = [System.Drawing.Color]::FromArgb(200, 130, 0)
-                $lblBanner.Text    = 'PROTECCION DESACTIVADA  -  los cambios se guardan en disco'
+                $lblBanner.Text    = 'PROTECCION DESACTIVADA  -  se reactivara al reiniciar'
+            } else {
+                $banner.BackColor  = [System.Drawing.Color]::FromArgb(178, 34, 34)
+                $lblBanner.Text    = 'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO hasta pulsar "Finalizar"'
             }
 
             $lblFase.Text = $lblBanner.Text
@@ -1791,7 +1668,7 @@ la proteccion por su cuenta en el siguiente arranque.
                 if ($u.OverlayMaxMB -gt 0) { $numTam.Value = & $mbAGb $u.OverlayMaxMB }
                 & $mostrarUmbrales
                 if ($u.FiltroActual) {
-                    $lblOvEstado.Text = 'La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. Si los cambias, al aplicar se abrira la ventana de mantenimiento sola y el equipo se reiniciara dos veces.'
+                    $lblOvEstado.Text = 'La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. Si los cambias, se quedaran pendientes hasta que inicies un mantenimiento y pulses "Finalizar".'
                     $lblOvEstado.ForeColor = [System.Drawing.Color]::FromArgb(150, 80, 0)
                 } else {
                     $lblOvEstado.Text = 'La proteccion esta desactivada: se puede cambiar todo. Los cambios se aplican tras reiniciar.'
@@ -1942,8 +1819,6 @@ la proteccion por su cuenta en el siguiente arranque.
             $errores = @(Aplicar-Perfil (Leer-Perfil) $u.FiltroActual)
             $r = Invoke-Uwf @('filter','enable')
             if (-not $r.Ok) { throw "No se ha podido activar el filtro:`n`n$($r.Salida)" }
-            # Como cualquier activacion del filtro, el vigilante lo confirma en el arranque
-            Guardar-Estado 'verificando'
             Escribir-Log 'PrepararEquipo' $(if ($errores.Count -eq 0) {'OK'} else {'PARCIAL'}) "$($errores.Count) avisos"
             $form.Cursor = 'Default'
             & $refrescar
@@ -2062,9 +1937,9 @@ la proteccion por su cuenta en el siguiente arranque.
         $detalle = (@(Get-ResumenPendientes $p) | ForEach-Object { "  - $_" }) -join "`n"
         $aviso = "Se van a aplicar estos cambios:`n`n$detalle`n`n"
         if ($requiereOff) {
-            $aviso += "Cambiar el tamano o el sitio exige desactivar la proteccion, asi que el equipo se`nreiniciara DOS veces: la primera para aplicarlo sin proteccion y la segunda para`nvolver a protegerlo. No hay que hacer nada entre medias.`n`nContinuar?"
+            $aviso += "El tamano y el sitio del uso del disco solo pueden cambiarse sin proteccion: se`nquedaran pendientes hasta que inicies un mantenimiento y pulses `"Finalizar`".`nEl resto se aplica ahora y surte efecto al reiniciar.`n`nContinuar?"
         } else {
-            $aviso += "El equipo se reiniciara una vez para que surtan efecto.`n`nContinuar?"
+            $aviso += "Surtiran efecto al reiniciar el equipo.`n`nContinuar?"
         }
         if ([System.Windows.Forms.MessageBox]::Show($aviso, 'UWF Aulas', 'YesNo', 'Warning') -ne 'Yes') { return }
 
@@ -2077,11 +1952,7 @@ la proteccion por su cuenta en el siguiente arranque.
                 [System.Windows.Forms.MessageBox]::Show(
                     "Aplicado con avisos:`n`n" + ($res.Errores -join "`n"), 'UWF Aulas', 'OK', 'Warning') | Out-Null
             }
-            if ($requiereOff -and $res.EsperandoFiltroOff) {
-                Iniciar-AplicacionPendientes
-                & $refrescar
-                Reiniciar-Equipo 'aplicar cambios pendientes sin proteccion'
-            } elseif ($res.Aplicados.Count) {
+            if ($res.Aplicados.Count) {
                 & $preguntarReinicio 'cambios pendientes aplicados'
             }
         } catch {
@@ -2208,19 +2079,34 @@ la proteccion por su cuenta en el siguiente arranque.
     })
 
     $btnFinalizarM.Add_Click({
+        $lineasPend = @(Get-ResumenPendientes (Leer-Pendientes))
+        if ($lineasPend.Count) {
+            $lista = ($lineasPend | ForEach-Object { "  - $_" }) -join "`n"
+            $r = [System.Windows.Forms.MessageBox]::Show(
+                "Antes de proteger el equipo se aplicaran estos cambios pendientes:`n`n$lista`n`nDespues se reactiva la proteccion y se reinicia. Continuar?",
+                'UWF Aulas', 'YesNo', 'Warning')
+            if ($r -ne 'Yes') { return }
+        }
         try {
-            Finalizar-Mantenimiento
+            $form.Cursor = 'WaitCursor'
+            $res = Finalizar-Mantenimiento
+            $form.Cursor = 'Default'
             & $refrescar
+            if ($res.Errores.Count) {
+                [System.Windows.Forms.MessageBox]::Show(
+                    ("La proteccion se ha reactivado, pero algunos cambios pendientes han fallado y siguen en la cola:`n`n" +
+                     ($res.Errores -join "`n")), 'UWF Aulas', 'OK', 'Warning') | Out-Null
+            }
             Reiniciar-Equipo 'cierre de mantenimiento'
-        } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
+        } catch {
+            $form.Cursor = 'Default'
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null
+        }
     })
 
     $btnGuardarCfg.Add_Click({
         try {
-            Guardar-Config ([pscustomobject]@{
-                rutaLogRed            = $txtRed.Text.Trim()
-                horasMaxMantenimiento = [int]$numHoras.Value
-            })
+            Guardar-Config ([pscustomobject]@{ rutaLogRed = $txtRed.Text.Trim() })
             $lblBarra.Text = 'Configuracion guardada'
         } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
     })
@@ -2230,10 +2116,8 @@ la proteccion por su cuenta en el siguiente arranque.
     # Carga inicial
     $cfg = Leer-Config
     $txtRed.Text   = [string]$cfg.rutaLogRed
-    $numHoras.Value = [int]$(if ($cfg.horasMaxMantenimiento) { $cfg.horasMaxMantenimiento } else { 8 })
 
-    $estadoActual = Leer-Estado
-    if ($estadoActual -and (@('mantenimiento','aplicando') -contains $estadoActual.fase)) { $tabs.SelectedTab = $tabMant }
+    if ((Test-UwfInstalado) -and -not (Test-FiltroActivoAhora)) { $tabs.SelectedTab = $tabMant }
 
     & $refrescar
     [void]$form.ShowDialog()
@@ -2245,7 +2129,9 @@ la proteccion por su cuenta en el siguiente arranque.
 Inicializar-Carpeta
 
 if ($Vigilante) {
-    try { Ejecutar-Vigilante } catch { Escribir-Log 'Vigilante' 'ERROR' $_.Exception.Message }
+    # El modo vigilante ya no existe. Si la tarea de una version anterior sigue registrada,
+    # se borra y se sale sin tocar el filtro.
+    Eliminar-TareaAntigua
     return
 }
 
@@ -2262,20 +2148,18 @@ if (-not (Test-Administrador)) {
 if (-not (Test-Path -LiteralPath $script:PerfilPath)) { Guardar-Perfil (Get-PerfilPredeterminado) }
 
 try {
-    Instalar-Vigilante
+    Instalar-Copia
     Crear-AccesoDirecto
 } catch {
     Escribir-Log 'Autoinstalacion' 'ERROR' $_.Exception.Message
-    # No basta con dejarlo en el log: si la copia de ProgramData se ha quedado en una version
-    # anterior, el vigilante que corre al arrancar no conoce la fase 'aplicando' y un equipo
-    # podria quedarse sin proteccion. El tecnico tiene que saberlo.
+    # No basta con dejarlo en el log: el acceso directo seguiria abriendo la version anterior
+    # y el tecnico no sabria por que.
     [System.Windows.Forms.MessageBox]::Show(
         ("No se ha podido actualizar la copia instalada en`n$($script:ScriptDest)`n`n" +
          "$($_.Exception.Message)`n`n" +
-         'La herramienta se abrira igualmente, pero NO uses "Aplicar cambios y reiniciar" ' +
-         'hasta resolverlo: el vigilante que arranca con el equipo seguiria siendo el ' +
-         'anterior. Cierra la herramienta, espera unos segundos tras el arranque y vuelve a ' +
-         'ejecutarla.'),
+         'La herramienta se abrira igualmente, pero el acceso directo del escritorio ' +
+         'seguira abriendo la version anterior. Cierra las demas ventanas de la ' +
+         'herramienta y vuelve a ejecutar esta.'),
         'UWF Aulas', 'OK', 'Warning') | Out-Null
 }
 

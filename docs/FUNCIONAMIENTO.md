@@ -12,7 +12,7 @@ quede sin proteccion. Para una vista rapida de las funciones y de como compilar,
 3. [Como lee y como actua sobre UWF](#3-como-lee-y-como-actua-sobre-uwf)
 4. [Instalacion y actualizacion en cada equipo](#4-instalacion-y-actualizacion-en-cada-equipo)
 5. [La cola de cambios pendientes](#5-la-cola-de-cambios-pendientes)
-6. [Fases y vigilante](#6-fases-y-vigilante)
+6. [Mantenimiento](#6-mantenimiento)
 7. [Exclusiones](#7-exclusiones)
 8. [Uso del disco (overlay)](#8-uso-del-disco-overlay)
 9. [Perfiles](#9-perfiles)
@@ -33,32 +33,31 @@ siempre al mismo estado, pero eso tambien impide instalar actualizaciones o camb
 configuracion de forma permanente.
 
 UWF trae un *servicing mode* para eso, pero es fragil y no cubre el software de terceros.
-UWFManager lo sustituye por un flujo mas simple y vigilado:
+UWFManager lo sustituye por un flujo mas simple y manual:
 
 - Para cambiar algo de forma permanente se **desactiva el filtro**, se reinicia, se trabaja
-  y se **vuelve a activar**.
-- Una **tarea programada** (el *vigilante*) comprueba en cada arranque que la proteccion ha
-  vuelto y la reactiva sola si alguien se olvida.
+  y el tecnico lo **vuelve a activar** con un boton. Nada lo reactiva por su cuenta: no hay
+  ningun proceso en segundo plano.
 - Los cambios de configuracion de UWF (exclusiones y uso del disco) **no se aplican al
   momento**: se encolan y se aplican de una vez con un solo boton.
 
 ## 2. Piezas
 
 ```
-+--------------------------+        +----------------------------+
-|  Interfaz (tecnico)      |        |  Vigilante (SYSTEM)        |
-|  UWFManager.exe          |        |  misma app, --vigilante    |
-|  o UWF-Aulas.ps1         |        |  en cada arranque          |
-+------------+-------------+        +-------------+--------------+
-             |  lee / escribe                     |  lee / escribe
-             v                                    v
++--------------------------+
+|  Interfaz (tecnico)      |
+|  UWFManager.exe          |
+|  o UWF-Aulas.ps1         |
++------------+-------------+
+             |  lee / escribe
+             v
       +-------------------------------------------------------+
       |  C:\ProgramData\UWF-Aulas\                            |
-      |  config.json  estado.json  pendientes.json            |
+      |  config.json  pendientes.json                         |
       |  perfil-exclusiones.json  uwf-aulas.log  copia de app |
       +-------------------------------------------------------+
-             |                                    |
-             v                                    v
+             |
+             v
       +-------------------------------------------------------+
       |  UWF:  WMI (leer)          uwfmgr.exe (actuar)        |
       +-------------------------------------------------------+
@@ -73,11 +72,16 @@ UWFManager lo sustituye por un flujo mas simple y vigilado:
   pendientes creada con una la entiende la otra. Cualquier cambio de logica tiene que
   hacerse en las dos.
 - **Interfaz**: la usa el tecnico. Se abre sin argumentos y exige ser administrador.
-- **Vigilante**: el mismo programa lanzado con `--vigilante` (o `-Vigilante` en el `.ps1`)
-  por la tarea programada `UWF-Aulas-Vigilante`, como `SYSTEM`, en cada arranque. No tiene
-  interfaz: todo lo que hace queda en el log.
-- **Carpeta de trabajo** `C:\ProgramData\UWF-Aulas\`: el estado compartido entre la
-  interfaz y el vigilante (ver [seccion 11](#11-ficheros-que-guarda-en-el-equipo)).
+- **Carpeta de trabajo** `C:\ProgramData\UWF-Aulas\`: configuracion, cola y log (ver
+  [seccion 11](#11-ficheros-que-guarda-en-el-equipo)). Esta carpeta no es una exclusion de
+  UWF: lo que la herramienta escribe ahi con el filtro activo se lleva al disco real con
+  `uwfmgr file commit` (o `commit-delete` si se borra). Sin eso, la cola y la configuracion
+  se perderian en el siguiente reinicio.
+- Las versiones anteriores tenian un *vigilante*: una tarea programada de arranque
+  (`UWF-Aulas-Vigilante`) que reactivaba la proteccion sola. Se ha quitado porque, al no
+  persistir sus ficheros de estado, reactivaba el filtro en cuanto arrancaba un
+  mantenimiento. La version actual borra esa tarea si la encuentra (ver
+  [seccion 4](#4-instalacion-y-actualizacion-en-cada-equipo)).
 
 ## 3. Como lee y como actua sobre UWF
 
@@ -102,17 +106,23 @@ Cada vez que se abre la interfaz (como administrador):
    el codigo.
 2. Se compara por **hash SHA-256** la copia instalada en `C:\ProgramData\UWF-Aulas\` con la
    que se esta ejecutando. Si son distintas, se sustituye. Como Windows no deja sobrescribir
-   un ejecutable en uso, se intenta por este orden:
-   1. copiar encima;
-   2. terminar la tarea del vigilante (que suele tenerlo abierto) y copiar;
-   3. renombrar la copia en uso a `.old-<fecha>` y copiar la nueva al lado. Los `.old-*`
-      se borran en la siguiente ejecucion.
-3. Se registra (o se vuelve a registrar) la tarea programada del vigilante.
+   un ejecutable en uso, si copiar encima falla se renombra la copia en uso a
+   `.old-<fecha>` y se copia la nueva al lado. Los `.old-*` se borran en la siguiente
+   ejecucion. Con el filtro activo, la copia nueva se lleva al disco real con
+   `uwfmgr file commit`.
+3. Se borra la tarea `UWF-Aulas-Vigilante` de versiones anteriores, si existe, y el
+   `estado.json` que usaba.
 4. Se crea el acceso directo `UWF Aulas.lnk` en el escritorio publico.
 
-Si no se puede sustituir la copia instalada, la interfaz **lo avisa** y pide no usar
-"Aplicar cambios y reiniciar": un vigilante antiguo no sabria cerrar la fase de aplicacion
-de cambios (ver [seccion 6](#6-fases-y-vigilante)).
+Si no se puede sustituir la copia instalada, la interfaz **lo avisa**: el acceso directo
+seguiria abriendo la version anterior.
+
+### Equipos con una version anterior (con vigilante)
+
+Con el filtro activo, borrar la tarea no es definitivo: el registro de tareas tambien esta
+protegido y la tarea reaparece al reiniciar. No pasa nada, porque la tarea lanza la copia
+instalada, que ya es la version nueva, y esta la vuelve a borrar sin tocar el filtro. En el
+primer arranque sin proteccion (al iniciar un mantenimiento) el borrado queda definitivo.
 
 Por eso, **actualizar un equipo es solo ejecutar la version nueva una vez**.
 
@@ -124,8 +134,7 @@ Por eso, **actualizar un equipo es solo ejecutar la version nueva una vez**.
    queda siempre en el log, tambien si falla.
 2. **Preparar equipo** (pestana Estado). Protege el volumen `C:`, aplica el perfil de
    exclusiones guardado y activa el filtro. Si `uwfmgr` falla al proteger `C:` o al activar
-   el filtro, se muestra el error y no se da el equipo por preparado. Tras activar el
-   filtro deja la fase `verificando` para que el vigilante lo confirme en el arranque.
+   el filtro, se muestra el error y no se da el equipo por preparado.
 
 ## 5. La cola de cambios pendientes
 
@@ -137,7 +146,8 @@ Motivos:
 
 - Se puede preparar todo, revisarlo y aplicarlo con un solo reinicio.
 - La cola se ve aunque UWF todavia no este instalado en el equipo.
-- Nada se queda a medias: lo que no se puede aplicar en ese momento sigue en la cola.
+- Nada se queda a medias: lo que no se puede aplicar en ese momento sigue en la cola, y la
+  cola sobrevive a los reinicios aunque el filtro este activo.
 
 Reglas de la cola:
 
@@ -155,13 +165,12 @@ Reglas de la cola:
 Hay que cambiar el tipo o el tamano del uso del disco con el filtro activo?
  |
  +-- NO --> se aplican exclusiones y umbrales
- |          --> se pregunta si reiniciar (1 reinicio)
+ |          --> se pregunta si reiniciar
  |
  +-- SI --> se aplican exclusiones y umbrales
-            --> se desactiva el filtro, fase 'aplicando', reinicio (1)
-            --> el vigilante aplica tipo y tamano, reactiva el filtro,
-                fase 'verificando', reinicio (2)
-            --> el vigilante confirma que el filtro esta activo y cierra la fase
+            --> el tipo y el tamano se quedan en la cola
+            --> se aplican al pulsar "3 - Finalizar, proteger y reiniciar"
+                durante un mantenimiento
 ```
 
 Lo que UWF permite cambiar en cada situacion:
@@ -175,41 +184,24 @@ Lo que UWF permite cambiar en cada situacion:
 Si un cambio falla al aplicarse (por ejemplo, `uwfmgr` devuelve error), **se queda en la
 cola** y el error se muestra y se registra.
 
-## 6. Fases y vigilante
+## 6. Mantenimiento
 
-La "fase" en curso se guarda en `estado.json`. Si el fichero no existe, no hay ninguna
-operacion abierta.
+El mantenimiento lo abre y lo cierra el tecnico. No hay fases guardadas ni nada que actue
+en el arranque: el estado se deduce del filtro, que se lee por WMI.
 
-```mermaid
-stateDiagram-v2
-    [*] --> SinFase
-    SinFase --> mantenimiento: "1 - Iniciar mantenimiento"<br/>(filtro OFF + reinicio)
-    SinFase --> aplicando: "Aplicar cambios" con tipo/tamano<br/>(filtro OFF + reinicio)
-    SinFase --> verificando: "Preparar equipo"
-    mantenimiento --> verificando: "3 - Finalizar y proteger"<br/>(filtro ON + reinicio)
-    mantenimiento --> verificando: vigilante, si se supera<br/>el maximo de horas
-    aplicando --> verificando: vigilante aplica la cola,<br/>filtro ON + reinicio
-    verificando --> SinFase: vigilante ve el filtro activo
-    verificando --> verificando: vigilante reintenta<br/>(maximo 3 reinicios)
-```
+1. **1 - Iniciar mantenimiento y reiniciar** (solo con el filtro activo): desactiva el
+   filtro para el siguiente arranque y reinicia.
+2. El equipo arranca sin proteccion. Todo lo que se haga se guarda de forma permanente.
+3. **3 - Finalizar, proteger y reiniciar** (solo con el filtro desactivado): aplica la cola
+   de pendientes (con el filtro desactivado se puede todo, tambien el tipo y el tamano del
+   uso del disco), reactiva el filtro y reinicia. Si hay cambios en la cola, antes pide
+   confirmacion mostrandolos. Si alguno falla, **se reactiva la proteccion igualmente**, se
+   muestra el error y el cambio sigue en la cola.
 
-Que hace el vigilante en cada arranque:
-
-| Fase | Situacion | Accion |
-|---|---|---|
-| ninguna | filtro activo | Nada. |
-| ninguna | filtro desactivado | Anota un `AVISO` en el log (alguien lo desactivo fuera de la herramienta). |
-| `mantenimiento` | | Si hay cola y el filtro esta desactivado, la aplica aprovechando el arranque sin proteccion. Si la ventana lleva abierta mas de las **horas maximas** (8 por defecto, configurable), reactiva el filtro, pasa a `verificando` y reinicia. Si no, anota cuanto lleva abierta. Aqui no reinicia por su cuenta, porque el tecnico puede estar trabajando. |
-| `aplicando` | filtro desactivado | Aplica la cola, **reactiva el filtro aunque la cola falle**, pasa a `verificando` y reinicia. |
-| `aplicando` | filtro activo (inesperado) | Anota un error y pasa a `verificando` sin tocar nada. |
-| `verificando` | filtro activo | Lo confirma en el log y borra `estado.json`. |
-| `verificando` | filtro desactivado | Reintenta activarlo y reinicia. **Como maximo 3 veces**: despues anota en el log que hace falta revisar el equipo y deja de reiniciar, para no dejarlo en un bucle de reinicios. |
-
-Dos protecciones mas:
-
-- Si `estado.json` no tiene una fecha de inicio legible, una ventana de mantenimiento se da
-  por caducada y se reactiva la proteccion. Ante la duda, se protege.
-- Cualquier error inesperado del vigilante se anota en el log; nunca muestra ventanas.
+**La proteccion no vuelve sola.** Si el tecnico no pulsa *Finalizar*, el equipo sigue sin
+proteger en todos los arranques. Para que no pase desapercibido, la interfaz se abre
+directamente en la pestana Mantenimiento y con el banner en rojo mientras el filtro este
+desactivado.
 
 ## 7. Exclusiones
 
@@ -353,33 +345,35 @@ al repositorio: el `.gitignore` excluye `*.local.json`.
 El **banner superior** resume el estado:
 
 - **Verde** "PROTECCION ACTIVA": el filtro esta activo.
-- **Naranja** "PROTECCION DESACTIVADA": el filtro esta desactivado.
-- **Rojo** "MANTENIMIENTO EN CURSO" o "APLICANDO CAMBIOS PENDIENTES": hay una fase abierta y
-  el equipo no esta protegido.
+- **Naranja** "PROTECCION DESACTIVADA - se reactivara al reiniciar": ya se ha pulsado
+  *Finalizar* y falta el reinicio.
+- **Rojo** "MANTENIMIENTO EN CURSO": el filtro esta desactivado y seguira asi hasta pulsar
+  *Finalizar*.
+- **Naranja** "UWF NO ESTA INSTALADO": la caracteristica no esta en el equipo.
 
 La **barra de cambios pendientes**, abajo, muestra lo que hay en la cola y los botones
 **Aplicar cambios y reiniciar** y **Descartar**.
 
 | Pestana | Que tiene |
 |---|---|
-| **Estado** | Resumen: caracteristica UWF, filtro ahora y tras reiniciar, volumenes protegidos, uso del disco y su consumo (con barra), fase de mantenimiento y numero de pendientes. Botones *Instalar caracteristica UWF* (solo si no esta), *Preparar equipo* y *Actualizar estado*. |
+| **Estado** | Resumen: caracteristica UWF, filtro ahora y tras reiniciar, volumenes protegidos, uso del disco y su consumo (con barra), si hay un mantenimiento en curso y numero de pendientes. Botones *Instalar caracteristica UWF* (solo si no esta), *Preparar equipo* y *Actualizar estado*. |
 | **Exclusiones** | Resumen de lo permitido, lista de exclusiones y pendientes (ver [seccion 7](#7-exclusiones)). Botones *Anadir por programa*, *Carpeta*, *Archivo*, *Clave HKLM*, *Quitar*, *Importar perfil* y *Exportar perfil*. *Quitar* sobre un pendiente lo saca de la cola y sobre una exclusion permitida encola su retirada. |
 | **Uso del disco** | Tipo, tamano en GB y, debajo, los umbrales calculados (en % de llenado y en GB), y el boton *Anadir a los cambios pendientes*. Si hay un cambio encolado se muestran los valores pendientes, marcados como tales. |
-| **Mantenimiento** | Explicacion del flujo, botones *1 - Iniciar mantenimiento y reiniciar* (solo con el filtro activo) y *3 - Finalizar, proteger y reiniciar* (solo con el filtro desactivado), y las ultimas 40 lineas del log. Si hay un mantenimiento o una aplicacion de cambios en curso, la interfaz se abre directamente en esta pestana. |
-| **Configuracion** | Ruta de red para el log centralizado, horas maximas de mantenimiento y boton para abrir la carpeta de la herramienta. |
+| **Mantenimiento** | Explicacion del flujo, botones *1 - Iniciar mantenimiento y reiniciar* (solo con el filtro activo) y *3 - Finalizar, proteger y reiniciar* (solo con el filtro desactivado), y las ultimas 40 lineas del log. Si el filtro esta desactivado, la interfaz se abre directamente en esta pestana. |
+| **Configuracion** | Ruta de red para el log centralizado y boton para abrir la carpeta de la herramienta. |
 
 ## 11. Ficheros que guarda en el equipo
 
-Todos en `C:\ProgramData\UWF-Aulas\`:
+Todos en `C:\ProgramData\UWF-Aulas\`. Con el filtro activo, la herramienta los lleva al
+disco real con `uwfmgr file commit` al escribirlos (salvo el log):
 
 | Fichero | Contenido |
 |---|---|
-| `config.json` | `rutaLogRed` (carpeta de red del log centralizado, opcional) y `horasMaxMantenimiento` (8 por defecto). |
-| `estado.json` | Fase abierta: `fase` (`mantenimiento`, `aplicando` o `verificando`), `inicio` (fecha ISO), `tecnico`, `equipo`, `detalle` e `intentos` (reintentos del vigilante para reactivar el filtro). No existe si no hay fase abierta. |
+| `config.json` | `rutaLogRed` (carpeta de red del log centralizado, opcional). Las versiones anteriores guardaban tambien `horasMaxMantenimiento`; ahora se ignora. |
 | `pendientes.json` | Cola de cambios: `exclusiones` (lista de `{tipo: archivo|registro, accion: add|remove, valor}`) y `disco` (`{tipo, tamanoMB, avisoMB, criticoMB}` o `null`), mas `version`, `actualizado`, `tecnico` y `equipo`. Se borra cuando la cola queda vacia. |
 | `perfil-exclusiones.json` | Perfil activo (ver [seccion 9](#9-perfiles)). |
 | `uwf-aulas.log` | Registro local (ver [seccion 12](#12-registro-log)). |
-| `UWF-Aulas.exe` o `UWF-Aulas.ps1` | Copia instalada que ejecuta el vigilante. |
+| `UWF-Aulas.exe` o `UWF-Aulas.ps1` | Copia instalada, a la que apunta el acceso directo. |
 
 ## 12. Registro (log)
 
@@ -387,41 +381,42 @@ Cada accion relevante anade una linea CSV separada por `;` con seis columnas:
 
 ```
 fecha;equipo;usuario;accion;resultado;detalle
-2026-10-28 09:15:02;AULA1-PC07;SYSTEM;Vigilante;OK;Mantenimiento cerrado, filtro activo y verificado
+2026-10-28 09:15:02;AULA1-PC07;tecnico;FinalizarMantenimiento;OK;filtro activado, pendiente de reinicio
 ```
 
 - `resultado` es uno de `OK`, `PARCIAL`, `ERROR`, `AVISO` o `INFO`.
 - El `detalle` nunca debe contener `;`: la herramienta los sustituye en los textos que
   vienen de programas externos (DISM, `uwfmgr`) para no descuadrar las columnas.
+- Las lineas escritas con el filtro activo se pierden al reiniciar: el log local no se
+  lleva al disco real en cada escritura. El log de red si las conserva.
 - Si en Configuracion hay una ruta de red, cada linea se anade tambien a
   `<ruta>\uwf-aulas-AAAA-MM.csv`, un fichero por mes con los registros de todos los equipos.
   Si la red no esta disponible, se ignora sin afectar al resto.
 
 Acciones mas habituales: `InstalarCaracteristica`, `PrepararEquipo`, `EncolarExclusion`,
 `EncolarUsoDisco`, `AplicarPendientes`, `IniciarMantenimiento`, `FinalizarMantenimiento`,
-`Reinicio`, `Vigilante`, `ActualizarInstalacion` y `Autoinstalacion`.
+`Reinicio`, `ActualizarInstalacion`, `EliminarTareaAntigua`, `PersistirFichero` y
+`Autoinstalacion`.
 
 ## 13. Garantias de seguridad
 
 Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
 
-1. **El equipo no se queda sin proteccion en silencio.** Toda desactivacion del filtro deja
-   una fase en `estado.json`, y toda activacion deja `verificando` para que el vigilante la
-   confirme en el arranque. Una ventana de mantenimiento olvidada se cierra sola pasadas
-   las horas maximas.
-2. **Sin bucles de reinicio.** Si el filtro no consigue activarse, el vigilante lo intenta
-   como mucho 3 veces y despues avisa en el log.
+1. **El equipo no se queda sin proteccion en silencio.** Mientras el filtro esta
+   desactivado, el banner es rojo y la interfaz se abre en la pestana Mantenimiento.
+   Reactivarlo es decision del tecnico: nada lo hace por su cuenta.
+2. **La cola no se pierde al reiniciar.** Lo que la herramienta escribe con el filtro
+   activo se lleva al disco real con `uwfmgr file commit`.
 3. **Windows Update no se rompe.** Las rutas que necesita no se pueden excluir por ninguna
    via.
 4. **Los umbrales siempre son coherentes.** Se valida `aviso < critico <= tamano` en todas
    las entradas.
-5. **No se cambia el tipo ni el tamano con el filtro activo.** Esos cambios se aplazan y se
-   aplican en un arranque sin proteccion abierto a proposito.
+5. **No se cambia el tipo ni el tamano con el filtro activo.** Esos cambios se quedan en la
+   cola y se aplican al finalizar un mantenimiento.
 6. **Los fallos de `uwfmgr` no se esconden.** Las acciones comprueban su codigo de salida;
    un cambio que falla sigue en la cola y queda en el log.
-7. **El vigilante nunca muestra ventanas**: corre como `SYSTEM` sin usuario delante.
-8. **Una version nueva de la interfaz no convive con un vigilante viejo** sin avisar al
-   tecnico.
+7. **La reactivacion no depende de la cola.** Si un pendiente falla al finalizar, la
+   proteccion se reactiva igualmente.
 
 ## 14. Diagnostico de problemas
 
@@ -432,21 +427,22 @@ Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
 | Una exclusion aparece como "Permitida tras reiniciar" | Es normal si se anadio con el filtro activo: funcionara tras el siguiente reinicio. |
 | Una fila dice "NO EXISTE - revisar" | La ruta o clave no esta en el equipo: exclusion obsoleta o mal escrita. Se puede retirar con *Quitar*. |
 | Un cambio pendiente no desaparece de la cola | `uwfmgr` lo rechazo. El motivo esta en el aviso al aplicar y en el log (`AddExclusion...;ERROR`). |
-| El equipo arranca con el banner naranja sin mantenimiento abierto | Alguien desactivo el filtro fuera de la herramienta. El vigilante lo anota como `AVISO`. |
-| Log: "El filtro sigue sin activarse tras 3 intentos" | El vigilante ha dejado de reiniciar. Revisar el equipo en persona: `uwfmgr get-config` y el estado de la caracteristica. Al resolverlo, *Finalizar, proteger y reiniciar* vuelve a abrir la verificacion. |
-| Aviso "No se ha podido actualizar la copia instalada" | El vigilante tenia la copia en uso. Cerrar la herramienta, esperar unos segundos y volver a abrirla. No usar "Aplicar cambios y reiniciar" hasta que desaparezca el aviso. |
+| El banner esta en rojo sin que nadie haya iniciado un mantenimiento | Alguien desactivo el filtro fuera de la herramienta, o no se cerro un mantenimiento. Pulsar *3 - Finalizar, proteger y reiniciar*. |
+| La cola o la configuracion desaparecen tras reiniciar | `uwfmgr file commit` ha fallado. El motivo esta en el log de red (`PersistirFichero;ERROR`). |
+| Aviso "No se ha podido actualizar la copia instalada" | Otra ventana de la herramienta tenia la copia en uso. Cerrarlas todas y volver a abrir la version nueva. |
 | El estado no muestra el consumo del uso del disco | WMI no lo ha devuelto y tampoco se ha podido leer de `uwfmgr`. No afecta a la proteccion. |
 
 ## 15. Limitaciones conocidas
 
 - **Solo `C:`**: la herramienta protege y lista exclusiones solo del volumen `C:`.
-- **Permisos de la carpeta de trabajo**: el vigilante corre como `SYSTEM` y lee
-  `C:\ProgramData\UWF-Aulas\`, que hereda los permisos por defecto de `ProgramData`.
-  Endurecer esos permisos esta pendiente.
+- **Permisos de la carpeta de trabajo**: `C:\ProgramData\UWF-Aulas\` hereda los permisos
+  por defecto de `ProgramData`, que dejan crear ficheros a cualquier usuario. Un
+  `pendientes.json` plantado se aplicaria al pulsar *Aplicar* o *Finalizar* (el tecnico lo
+  ve antes en la lista). Endurecer esos permisos esta pendiente.
 - **Respaldo por texto**: si WMI no responde, el consumo del overlay y la lista de
   exclusiones se leen de la salida de `uwfmgr`; en ese caso no se distingue entre la sesion
   actual y la siguiente.
 - **No probado aqui con UWF real**: el equipo de desarrollo es Windows Pro, donde UWF no
-  existe. Lo que no toca UWF (cola, perfiles, umbrales, log, vigilante con UWF simulado,
-  interfaz) se prueba en desarrollo; la lectura y escritura real de UWF hay que validarla
+  existe. Lo que no toca UWF (cola, perfiles, umbrales, log, flujo de
+  mantenimiento con UWF simulado, interfaz) se prueba en desarrollo; la lectura y escritura real de UWF hay que validarla
   en un equipo Enterprise o Education.

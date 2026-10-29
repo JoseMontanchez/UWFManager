@@ -3,9 +3,8 @@
 UWF Aulas v2 - gestion del Unified Write Filter para las aulas de la UV
 Port a Python del script original UWF-Aulas.ps1 (copia exacta de comportamiento).
 
-  Modo normal    : interfaz grafica para el tecnico  (sin argumentos)
-  Modo Vigilante : sin interfaz, lo lanza una tarea programada en cada arranque
-                   (--vigilante)
+  Interfaz grafica para el tecnico. No hay ningun proceso en segundo plano: la proteccion
+  solo se desactiva y se reactiva cuando el tecnico lo pide.
 
 Cambios v2 (heredados del original):
   - Corregidos los umbrales del overlay (aviso < critico) y validacion
@@ -17,9 +16,8 @@ Cambios v3:
   - Cola de cambios pendientes (pendientes.json): la GUI encola exclusiones y uso del
     disco, y nada llega a UWF hasta pulsar "Aplicar cambios y reiniciar". La lista se
     ve aunque UWF no este disponible en el equipo.
-  - Fase 'aplicando': si un pendiente exige el filtro desactivado (tipo o tamano), la
-    herramienta abre la ventana de mantenimiento sola y el vigilante la cierra tras
-    aplicar la cola, volviendo a proteger el equipo.
+  - Lo que exige el filtro desactivado (tipo o tamano del uso del disco) se queda en la
+    cola hasta que el tecnico pulsa "Finalizar" durante un mantenimiento.
   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
     claves de los perfiles JSON) se conserva el termino de UWF.
 
@@ -65,8 +63,7 @@ PendPath   = os.path.join(Base, 'pendientes.json')
 LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
-Tarea      = 'UWF-Aulas-Vigilante'
-MaxReintentosFiltro = 3   # reinicios que el vigilante intenta para reactivar el filtro
+TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
 Prohibidas = [
@@ -186,14 +183,14 @@ def escribir_log(accion, resultado='OK', detalle=''):
 
 
 def leer_config():
-    """Lee config.json (ruta de log en red, horas maximas de mantenimiento) o devuelve los valores por defecto."""
+    """Lee config.json (ruta de log en red) o devuelve los valores por defecto."""
     if os.path.isfile(CfgPath):
         try:
             with open(CfgPath, 'r', encoding='utf-8-sig') as fh:
                 return json.load(fh)
         except Exception:
             pass
-    return {'rutaLogRed': '', 'horasMaxMantenimiento': 8}
+    return {'rutaLogRed': ''}
 
 
 def guardar_config(cfg):
@@ -201,39 +198,7 @@ def guardar_config(cfg):
     inicializar_carpeta()
     with open(CfgPath, 'w', encoding='utf-8') as fh:
         json.dump(cfg, fh, indent=2, ensure_ascii=True)
-
-
-def leer_estado():
-    """Lee estado.json (fase de mantenimiento en curso) o None si no hay ninguna fase abierta."""
-    if os.path.isfile(EstadoPath):
-        try:
-            with open(EstadoPath, 'r', encoding='utf-8-sig') as fh:
-                return json.load(fh)
-        except Exception:
-            pass
-    return None
-
-
-def guardar_estado(fase, detalle='', intentos=0):
-    """Escribe estado.json con la fase actual, o lo borra si fase es None/vacio.
-    'intentos' cuenta los reintentos del vigilante para reactivar el filtro."""
-    inicializar_carpeta()
-    if not fase:
-        try:
-            os.remove(EstadoPath)
-        except OSError:
-            pass
-        return
-    datos = {
-        'fase':    fase,
-        'inicio':  _now('%Y-%m-%dT%H:%M:%S'),
-        'tecnico': os.environ.get('USERNAME', ''),
-        'equipo':  os.environ.get('COMPUTERNAME', socket.gethostname()),
-        'detalle': detalle,
-        'intentos': int(intentos),
-    }
-    with open(EstadoPath, 'w', encoding='utf-8') as fh:
-        json.dump(datos, fh, indent=2, ensure_ascii=True)
+    persistir_en_disco(CfgPath)
 
 
 def test_administrador():
@@ -268,6 +233,31 @@ def invoke_uwf(argumentos):
         return {'Codigo': proc.returncode, 'Salida': salida, 'Ok': proc.returncode == 0}
     except Exception as ex:
         return {'Codigo': -1, 'Salida': str(ex), 'Ok': False}
+
+
+def filtro_activo_ahora():
+    """True si el filtro protege la sesion actual. Consulta ligera, sin la foto completa de
+    get_estado_uwf."""
+    if not test_uwf_instalado():
+        return False
+    try:
+        f = _wmi_embedded().UWF_Filter()
+        return bool(f and f[0].CurrentEnabled)
+    except Exception:
+        return False
+
+
+def persistir_en_disco(ruta, borrado=False):
+    """Lleva al disco real un fichero de la herramienta escrito (o borrado) con la proteccion
+    activa. Sin esto se quedaba en el overlay y desaparecia al reiniciar: por ejemplo, la cola
+    de pendientes no sobrevivia al reinicio que abre el mantenimiento. Con el filtro desactivado
+    no hace falta, porque ya se escribe directamente en el disco."""
+    if not filtro_activo_ahora():
+        return
+    r = invoke_uwf(['file', 'commit-delete' if borrado else 'commit', ruta])
+    if not r['Ok']:
+        escribir_log('PersistirFichero', 'ERROR', '%s: %s'
+                     % (ruta, ' '.join(r['Salida'].replace(';', ',').split())))
 
 
 # =============================================================================
@@ -641,8 +631,8 @@ def remove_exclusion_registro(clave):
 #  El tecnico encola en pendientes.json todo lo que quiere cambiar (exclusiones y uso
 #  del disco) y lo aplica de una vez con "Aplicar cambios y reiniciar". Dos razones:
 #  la GUI puede mostrar lo decidido aunque UWF no este disponible todavia en el equipo,
-#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola para
-#  aplicarse en el arranque siguiente.
+#  y nada queda a medias: lo que no se puede aplicar ahora se conserva en la cola hasta
+#  que se pueda (lo que exige el filtro desactivado, al finalizar un mantenimiento).
 # =============================================================================
 
 def pendientes_vacios(p):
@@ -682,7 +672,8 @@ def guardar_pendientes(p):
         try:
             os.remove(PendPath)
         except OSError:
-            pass
+            return
+        persistir_en_disco(PendPath, borrado=True)
         return
     datos = {
         'version':     1,
@@ -694,6 +685,7 @@ def guardar_pendientes(p):
     }
     with open(PendPath, 'w', encoding='utf-8') as fh:
         json.dump(datos, fh, indent=2, ensure_ascii=True)
+    persistir_en_disco(PendPath)
 
 
 def _valor_pendiente(tipo, valor):
@@ -798,7 +790,7 @@ def aplicar_pendientes(filtro_activo):
 
     Exclusiones y umbrales se pueden registrar con el filtro activo o no (surten efecto tras
     reiniciar). El tipo y el tamano exigen el filtro desactivado: con la proteccion activa se
-    quedan encolados para aplicarse en el arranque de mantenimiento.
+    quedan encolados hasta que el tecnico finalice un mantenimiento.
 
     Devuelve {Aplicados, Errores, Restantes, EsperandoFiltroOff}.
     """
@@ -1094,7 +1086,7 @@ def aplicar_perfil(perfil, filtro_activo=False):
 
 
 # =============================================================================
-#  Tarea vigilante y autoinstalacion
+#  Autoinstalacion
 # =============================================================================
 
 def _pythonw():
@@ -1112,17 +1104,6 @@ def _script_origen():
         return os.path.abspath(__file__)
     except NameError:
         return os.path.abspath(sys.argv[0])
-
-
-def _accion_lanzamiento():
-    """Devuelve (ejecutable, argumento) para relanzar la copia instalada en modo vigilante.
-
-    Congelado: el propio .exe copiado, sin necesitar Python instalado en el equipo.
-    Dev (.py): pythonw.exe apuntando al .py copiado.
-    """
-    if Congelado:
-        return ScriptDest, '--vigilante'
-    return _pythonw(), '"%s" --vigilante' % ScriptDest
 
 
 def _huella(ruta):
@@ -1156,16 +1137,30 @@ def detectar_instalacion(origen=None):
     return r
 
 
-def _detener_tarea():
-    """Termina la instancia en curso de la tarea del vigilante, si la hay.
+def eliminar_tarea_antigua():
+    """Borra la tarea de arranque que registraban las versiones anteriores (el vigilante), y
+    con ella el estado.json que solo usaba esa tarea.
 
-    Hace falta porque el vigilante arranca con el equipo: si todavia esta corriendo, su .exe
-    esta en uso y Windows no deja sobrescribirlo.
+    Con la proteccion activa el borrado se deshace al reiniciar, porque el registro de tareas
+    tambien esta filtrado. No pasa nada: la tarea vuelve a lanzar la copia instalada, que ya es
+    esta version, y esta la borra otra vez. En el primer arranque sin proteccion (un
+    mantenimiento) el borrado queda definitivo.
     """
     try:
-        subprocess.run(['schtasks', '/end', '/tn', Tarea],
-                       capture_output=True, text=True, shell=False, **_sin_ventana())
+        consulta = subprocess.run(['schtasks', '/query', '/tn', TareaAntigua],
+                                  capture_output=True, text=True, shell=False, **_sin_ventana())
+        if consulta.returncode == 0:
+            subprocess.run(['schtasks', '/end', '/tn', TareaAntigua],
+                           capture_output=True, text=True, shell=False, **_sin_ventana())
+            r = subprocess.run(['schtasks', '/delete', '/tn', TareaAntigua, '/f'],
+                               capture_output=True, text=True, shell=False, **_sin_ventana())
+            escribir_log('EliminarTareaAntigua', 'OK' if r.returncode == 0 else 'ERROR',
+                         ' '.join(((r.stdout or '') + (r.stderr or '')).replace(';', ',').split()))
     except Exception:
+        pass
+    try:
+        os.remove(EstadoPath)
+    except OSError:
         pass
 
 
@@ -1181,7 +1176,7 @@ def _limpiar_restos():
                     os.remove(ruta)
                     borrados.append(nombre)
                 except OSError:
-                    pass          # sigue en uso: se intentara en el proximo arranque
+                    pass          # sigue en uso: se intentara en la proxima ejecucion
         if Congelado:
             viejo_py = os.path.join(Base, 'UWF-Aulas.py')
             if os.path.isfile(viejo_py):
@@ -1198,16 +1193,13 @@ def _limpiar_restos():
 def reemplazar_instalado(origen):
     """Sustituye la copia de ProgramData por la version que se esta ejecutando ahora.
 
-    Tres intentos, de menos a mas invasivo, porque Windows no permite sobrescribir un
-    ejecutable en uso:
-      1. Copiar encima.
-      2. Terminar la tarea del vigilante (que es quien suele tenerlo abierto) y repetir.
-      3. Apartar el instalado a un '.old-<fecha>' y copiar la nueva al lado. Renombrar un
-         .exe en uso si esta permitido; el .old se borra en la siguiente ejecucion.
+    Windows no permite sobrescribir un ejecutable en uso (por ejemplo, otra ventana de la
+    herramienta abierta desde el acceso directo). Si copiar encima falla, se aparta el
+    instalado a un '.old-<fecha>' y se copia la nueva al lado: renombrar un .exe en uso si
+    esta permitido, y el .old se borra en la siguiente ejecucion.
 
-    Devuelve (accion, detalle). Lanza excepcion solo si los tres intentos fallan, para que
-    quien llama pueda avisar al tecnico: una copia instalada vieja con una GUI nueva es
-    peligrosa, porque el vigilante antiguo no conoce la fase 'aplicando'.
+    Devuelve (accion, detalle). Lanza excepcion solo si los dos intentos fallan, para que
+    quien llama pueda avisar al tecnico.
     """
     previo = detectar_instalacion(origen)
 
@@ -1226,13 +1218,6 @@ def reemplazar_instalado(origen):
     except (OSError, PermissionError):
         pass
 
-    _detener_tarea()
-    try:
-        shutil.copy2(origen, ScriptDest)
-        return 'sustituido', '%s (tras detener la tarea)' % detalle
-    except (OSError, PermissionError):
-        pass
-
     apartado = '%s.old-%s' % (ScriptDest, _now('%Y%m%d%H%M%S'))
     os.replace(ScriptDest, apartado)      # si esto falla, propaga: no hay mas que intentar
     shutil.copy2(origen, ScriptDest)
@@ -1240,65 +1225,23 @@ def reemplazar_instalado(origen):
         detalle, os.path.basename(apartado))
 
 
-def instalar_vigilante():
-    """Sustituye la copia instalada por esta version y registra la tarea programada que lanza
-    el modo vigilante en cada arranque. Se ejecuta en cada arranque de la GUI, no solo la
-    primera vez, para que actualizar el equipo sea solo abrir el .exe nuevo."""
+def instalar_copia():
+    """Deja en ProgramData una copia de esta version, que es a la que apunta el acceso
+    directo, y borra la tarea de arranque de versiones anteriores. Se ejecuta en cada
+    arranque de la GUI, no solo la primera vez, para que actualizar el equipo sea solo abrir
+    el .exe nuevo."""
     inicializar_carpeta()
+    eliminar_tarea_antigua()
     origen = _script_origen()
     if origen and os.path.normcase(origen) != os.path.normcase(ScriptDest):
         accion, detalle = reemplazar_instalado(origen)
         if accion != 'sin cambios':
+            # Con la proteccion activa la copia nueva se perderia al reiniciar
+            persistir_en_disco(ScriptDest)
             escribir_log('ActualizarInstalacion', 'OK', '%s: %s' % (accion, detalle))
         restos = _limpiar_restos()
         if restos:
             escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
-
-    ejecutable, argumento = _accion_lanzamiento()
-    # Se registra con schtasks.exe y un XML en vez de PowerShell oculto: lanzar PowerShell sin
-    # ventana para crear una tarea de arranque como SYSTEM es justo lo que buscan las heuristicas
-    # de los antivirus. El XML permite los mismos ajustes que New-ScheduledTaskSettingsSet
-    # (con baterias, StartWhenAvailable), que schtasks no ofrece por linea de comandos.
-    xml = _xml_tarea(ejecutable, argumento)
-    ruta_xml = os.path.join(Base, 'tarea-vigilante.xml')
-    with open(ruta_xml, 'w', encoding='utf-16') as fh:
-        fh.write(xml)
-    try:
-        subprocess.run(['schtasks', '/create', '/tn', Tarea, '/xml', ruta_xml, '/f'],
-                       capture_output=True, text=True, shell=False, check=True, **_sin_ventana())
-    finally:
-        try:
-            os.remove(ruta_xml)
-        except OSError:
-            pass
-    escribir_log('InstalarVigilante', 'OK', ScriptDest)
-
-
-def _xml_tarea(ejecutable, argumento):
-    """Definicion de la tarea del vigilante: al arrancar el equipo, como SYSTEM (S-1-5-18) con
-    privilegios maximos, tambien con bateria. Mismos valores por defecto que
-    Register-ScheduledTask (IgnoreNew, limite de 72 h)."""
-    return (
-        '<?xml version="1.0" encoding="UTF-16"?>\n'
-        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
-        '  <RegistrationInfo><Description>Vigilante de UWFManager</Description></RegistrationInfo>\n'
-        '  <Triggers><BootTrigger><Enabled>true</Enabled></BootTrigger></Triggers>\n'
-        '  <Principals>\n'
-        '    <Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal>\n'
-        '  </Principals>\n'
-        '  <Settings>\n'
-        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
-        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
-        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
-        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
-        '    <ExecutionTimeLimit>PT72H</ExecutionTimeLimit>\n'
-        '    <Enabled>true</Enabled>\n'
-        '  </Settings>\n'
-        '  <Actions Context="Author">\n'
-        '    <Exec><Command>%s</Command><Arguments>%s</Arguments></Exec>\n'
-        '  </Actions>\n'
-        '</Task>\n'
-    ) % (xml_escape(ejecutable), xml_escape(argumento))
 
 
 def crear_acceso_directo():
@@ -1310,58 +1253,55 @@ def crear_acceso_directo():
         else:
             objetivo, argumentos = _pythonw(), '"%s"' % ScriptDest
             icono = '%s\\System32\\shell32.dll,48' % os.environ.get('SystemRoot', r'C:\WINDOWS')
-        ps = (
-            "$ws = New-Object -ComObject WScript.Shell;"
-            "$lnk = $ws.CreateShortcut('%s');"
-            "$lnk.TargetPath = '%s';"
-            "$lnk.Arguments = '%s';"
-            "$lnk.WorkingDirectory = '%s';"
-            "$lnk.IconLocation = '%s';"
-            "$lnk.Description = 'Gestion del Unified Write Filter';"
-            "$lnk.Save()"
-        ) % (destino, objetivo, argumentos, Base, icono)
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps],
-                       capture_output=True, text=True, shell=False, **_sin_ventana())
-    except Exception:
-        pass
+        # COM directo (pywin32) en vez de un PowerShell oculto: un .exe que lanza PowerShell sin
+        # ventana en cada arranque es de lo primero que marcan las heuristicas de los antivirus.
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        try:
+            lnk = win32com.client.Dispatch('WScript.Shell').CreateShortcut(destino)
+            lnk.TargetPath = objetivo
+            lnk.Arguments = argumentos
+            lnk.WorkingDirectory = Base
+            lnk.IconLocation = icono
+            lnk.Description = 'Gestion del Unified Write Filter'
+            lnk.Save()
+        finally:
+            pythoncom.CoUninitialize()
+        persistir_en_disco(destino)
+    except Exception as ex:
+        escribir_log('AccesoDirecto', 'ERROR', str(ex).replace(';', ','))
 
 
 # =============================================================================
 #  Flujo de mantenimiento
+#
+#  Todo lo decide el tecnico: la herramienta no tiene nada corriendo en segundo plano ni
+#  vuelve a proteger el equipo por su cuenta. Mientras el filtro esta desactivado, el
+#  banner de la ventana lo avisa en rojo.
 # =============================================================================
 
 def iniciar_mantenimiento():
-    """Paso 1 del flujo de mantenimiento: desactiva el filtro y marca la fase 'mantenimiento'."""
+    """Paso 1 del flujo de mantenimiento: desactiva el filtro a partir del siguiente arranque."""
     r = invoke_uwf(['filter', 'disable'])
     if not r['Ok']:
         raise RuntimeError('No se ha podido desactivar el filtro: %s' % r['Salida'])
-    guardar_estado('mantenimiento')
     escribir_log('IniciarMantenimiento', 'OK', 'filtro desactivado, pendiente de reinicio')
 
 
-def iniciar_aplicacion_pendientes():
-    """Abre una ventana de mantenimiento automatica, solo para aplicar los pendientes que exigen
-    el filtro desactivado (tipo y tamano del uso del disco).
-
-    Se distingue de un mantenimiento normal por la fase 'aplicando': el vigilante la reconoce en
-    el arranque siguiente, aplica la cola, vuelve a proteger el equipo y reinicia sin que el
-    tecnico tenga que hacer nada mas.
-    """
-    r = invoke_uwf(['filter', 'disable'])
-    if not r['Ok']:
-        raise RuntimeError('No se ha podido desactivar el filtro: %s' % r['Salida'])
-    guardar_estado('aplicando')
-    escribir_log('IniciarAplicacionPendientes', 'OK',
-                 'filtro desactivado para aplicar la cola, pendiente de reinicio')
-
-
 def finalizar_mantenimiento():
-    """Paso 3 del flujo de mantenimiento: reactiva el filtro y marca la fase 'verificando'."""
+    """Paso 3 del flujo de mantenimiento: aplica la cola de pendientes y reactiva el filtro.
+
+    Es el momento de aplicar lo que exige el filtro desactivado (tipo y tamano del uso del
+    disco). Los fallos de la cola no impiden proteger el equipo: se devuelven para que la GUI
+    los ensene y lo que falle se queda en la cola.
+    """
+    res = aplicar_pendientes(False)
     r = invoke_uwf(['filter', 'enable'])
     if not r['Ok']:
         raise RuntimeError('No se ha podido activar el filtro: %s' % r['Salida'])
-    guardar_estado('verificando')
     escribir_log('FinalizarMantenimiento', 'OK', 'filtro activado, pendiente de reinicio')
+    return res
 
 
 def reiniciar_equipo(motivo):
@@ -1372,126 +1312,6 @@ def reiniciar_equipo(motivo):
                          **_sin_ventana())
     except Exception as ex:
         escribir_log('Reinicio', 'ERROR', str(ex))
-
-
-# =============================================================================
-#  MODO VIGILANTE (sin interfaz, en cada arranque)
-# =============================================================================
-
-def ejecutar_vigilante():
-    """Logica del modo --vigilante, ejecutada en cada arranque por la tarea programada.
-
-    Sin fase abierta: solo avisa si el filtro esta desactivado sin motivo.
-    Fase 'verificando': confirma que el filtro volvio a activarse tras el mantenimiento (si no, reintenta).
-    Fase 'aplicando': arranque abierto por la herramienta para volcar la cola de pendientes; los
-      aplica, vuelve a proteger el equipo y reinicia.
-    Fase 'mantenimiento': aplica lo que haya encolado aprovechando que no hay proteccion y, si la
-      ventana lleva abierta mas horas que el limite configurado, reactiva la proteccion sola.
-    """
-    estado = leer_estado()
-    cfg = leer_config()
-    uwf = get_estado_uwf()
-
-    if not estado:
-        if uwf['Instalado'] and not uwf['FiltroActual']:
-            escribir_log('Vigilante', 'AVISO',
-                         'El equipo ha arrancado con el filtro desactivado y sin mantenimiento en curso')
-        return
-
-    fase = estado.get('fase')
-    if fase == 'aplicando':
-        # El equipo ha arrancado sin proteccion solo para volcar la cola. Pase lo que pase con los
-        # pendientes, el filtro tiene que quedar activo otra vez antes de devolver el equipo al aula.
-        if uwf['FiltroActual']:
-            escribir_log('Vigilante', 'ERROR',
-                         'Se esperaba el filtro desactivado para aplicar la cola; se deja para el tecnico')
-            guardar_estado('verificando')
-            return
-        try:
-            res = aplicar_pendientes(False)
-            escribir_log('Vigilante',
-                         'OK' if (not res['Errores'] and not res['Restantes']) else 'PARCIAL',
-                         'Cola aplicada: %d cambios, %d restantes, %d errores'
-                         % (len(res['Aplicados']), res['Restantes'], len(res['Errores'])))
-            for err in res['Errores']:
-                escribir_log('Vigilante', 'ERROR', err)
-        except Exception as ex:
-            escribir_log('Vigilante', 'ERROR', 'Al aplicar la cola: %s' % ex)
-        try:
-            r = invoke_uwf(['filter', 'enable'])
-            if not r['Ok']:
-                escribir_log('Vigilante', 'ERROR', 'No se ha podido reactivar el filtro: %s' % r['Salida'])
-            guardar_estado('verificando')
-            reiniciar_equipo('cierre automatico tras aplicar los cambios pendientes')
-        except Exception as ex:
-            escribir_log('Vigilante', 'ERROR', str(ex))
-    elif fase == 'verificando':
-        if uwf['FiltroActual']:
-            escribir_log('Vigilante', 'OK', 'Mantenimiento cerrado, filtro activo y verificado')
-            guardar_estado(None)
-        else:
-            # Tope de reintentos: si 'filter enable' no consigue nada, reiniciar sin limite
-            # dejaria el equipo en un bucle de reinicios que solo se arregla yendo al aula.
-            try:
-                intentos = int(estado.get('intentos') or 0)
-            except (TypeError, ValueError):
-                intentos = 0
-            if intentos >= MaxReintentosFiltro:
-                escribir_log('Vigilante', 'ERROR',
-                             'El filtro sigue sin activarse tras %d intentos. No se reinicia mas: '
-                             'hace falta revisar el equipo' % intentos)
-                return
-            escribir_log('Vigilante', 'ERROR',
-                         'El filtro deberia estar activo y no lo esta. Reintento %d de %d'
-                         % (intentos + 1, MaxReintentosFiltro))
-            try:
-                r = invoke_uwf(['filter', 'enable'])
-                if not r['Ok']:
-                    escribir_log('Vigilante', 'ERROR', 'filter enable: %s'
-                                 % ' '.join(r['Salida'].replace(';', ',').split()))
-                guardar_estado('verificando', intentos=intentos + 1)
-                reiniciar_equipo('reactivando proteccion')
-            except Exception as ex:
-                escribir_log('Vigilante', 'ERROR', str(ex))
-    elif fase == 'mantenimiento':
-        # Arranque de mantenimiento: se aprovecha que no hay proteccion para volcar la cola.
-        # Aqui no se reinicia, porque el tecnico esta trabajando en el equipo.
-        if not uwf['FiltroActual'] and not pendientes_vacios(leer_pendientes()):
-            try:
-                res = aplicar_pendientes(False)
-                escribir_log('Vigilante',
-                             'OK' if (not res['Errores'] and not res['Restantes']) else 'PARCIAL',
-                             'Cola aplicada en mantenimiento: %d cambios, %d restantes, %d errores'
-                             % (len(res['Aplicados']), res['Restantes'], len(res['Errores'])))
-                for err in res['Errores']:
-                    escribir_log('Vigilante', 'ERROR', err)
-            except Exception as ex:
-                escribir_log('Vigilante', 'ERROR', 'Al aplicar la cola en mantenimiento: %s' % ex)
-
-        maximo = 8
-        try:
-            if cfg.get('horasMaxMantenimiento'):
-                maximo = float(cfg['horasMaxMantenimiento'])
-        except (TypeError, ValueError):
-            pass
-        try:
-            horas = (datetime.now() - datetime.fromisoformat(str(estado['inicio']))).total_seconds() / 3600.0
-        except (KeyError, TypeError, ValueError):
-            # Sin fecha legible no se puede saber cuanto lleva abierto: ante la duda se
-            # protege el equipo, que es el fallo menos grave.
-            escribir_log('Vigilante', 'AVISO', 'estado.json sin fecha de inicio valida')
-            horas = maximo
-        if horas >= maximo:
-            escribir_log('Vigilante', 'AVISO',
-                         'Mantenimiento abierto %.1f h, se reactiva la proteccion automaticamente' % horas)
-            try:
-                invoke_uwf(['filter', 'enable'])
-                guardar_estado('verificando')
-                reiniciar_equipo('cierre automatico de mantenimiento')
-            except Exception as ex:
-                escribir_log('Vigilante', 'ERROR', str(ex))
-        else:
-            escribir_log('Vigilante', 'INFO', 'Mantenimiento en curso desde hace %.1f h' % horas)
 
 
 # =============================================================================
@@ -1851,8 +1671,8 @@ def mostrar_interfaz():
         '- Disco: reserva el espacio en C:. Recomendado para las aulas: no resta memoria al equipo.\n'
         '- RAM:   mas rapido, pero consume memoria fisica segun se llena. Solo para equipos con mucha RAM.\n\n'
         'Los cambios de aqui tampoco se aplican al momento: se encolan como pendientes. El tamano y '
-        'el sitio solo pueden cambiarse con la proteccion desactivada, asi que si hace falta se '
-        'abrira la ventana de mantenimiento sola al aplicar.'))
+        'el sitio solo pueden cambiarse con la proteccion desactivada: si la proteccion esta activa, '
+        'se quedan en la cola hasta que pulses "Finalizar" durante un mantenimiento.'))
     lbl_ov1.place(x=16, y=16, width=880, height=160)
 
     gb_tipo = tk.LabelFrame(tab_overlay, text='Donde se guarda')
@@ -1922,10 +1742,9 @@ def mostrar_interfaz():
         'Flujo de mantenimiento (sustituye al servicing mode de UWF):\n\n'
         '  1. Iniciar mantenimiento    ->  desactiva el filtro y reinicia\n'
         '  2. El equipo arranca sin proteccion: instala parches, actualiza Kaspersky, cambia lo que necesites\n'
-        '  3. Finalizar y proteger     ->  reactiva el filtro y reinicia\n'
-        '  4. Al arrancar, el vigilante comprueba que la proteccion ha vuelto y lo anota en el registro\n\n'
-        'Si el mantenimiento se queda abierto mas horas de las configuradas, el vigilante reactiva\n'
-        'la proteccion por su cuenta en el siguiente arranque.'))
+        '  3. Finalizar y proteger     ->  aplica los cambios pendientes, reactiva el filtro y reinicia\n\n'
+        'La proteccion NO vuelve sola: hasta que pulses "Finalizar", el equipo sigue sin proteger\n'
+        'en todos los arranques. No dejes el aula sin cerrar el mantenimiento.'))
     lbl_mant.place(x=16, y=16, width=880, height=210)
 
     lbl_fase = tk.Label(tab_mant, anchor='w', font=('Segoe UI', 10, 'bold'))
@@ -1944,13 +1763,10 @@ def mostrar_interfaz():
     tk.Label(tab_cfg, text='Ruta de red para el registro centralizado (opcional):').place(x=16, y=20)
     txt_red = tk.Entry(tab_cfg)
     txt_red.place(x=16, y=46, width=600, height=24)
-    tk.Label(tab_cfg, text='Horas maximas con el mantenimiento abierto antes de reactivar la proteccion:').place(x=16, y=86)
-    num_horas = tk.Spinbox(tab_cfg, from_=1, to=72, width=6)
-    num_horas.place(x=16, y=112, width=80, height=24)
     btn_guardar_cfg = tk.Button(tab_cfg, text='Guardar configuracion')
-    btn_guardar_cfg.place(x=16, y=156, width=200, height=34)
+    btn_guardar_cfg.place(x=16, y=90, width=200, height=34)
     btn_abrir_carpeta = tk.Button(tab_cfg, text='Abrir carpeta de la herramienta')
-    btn_abrir_carpeta.place(x=228, y=156, width=240, height=34)
+    btn_abrir_carpeta.place(x=228, y=90, width=240, height=34)
 
     # ============================ LOGICA GUI =================================
     def refrescar():
@@ -1959,7 +1775,6 @@ def mostrar_interfaz():
         incluidos), barra de pendientes y las ultimas lineas del log."""
         try:
             u = get_estado_uwf()
-            es = leer_estado()
             pend = leer_pendientes()
             lineas_pend = resumen_pendientes(pend)
 
@@ -1977,8 +1792,8 @@ def mostrar_interfaz():
                     texto_gb(u['OverlayUsoMB']),
                     ' (%d %%)' % (100 * u['OverlayUsoMB'] // u['OverlayMaxMB']) if u['OverlayMaxMB'] > 0 else ''))
             lineas.append('')
-            if es:
-                lineas.append("Mantenimiento       : fase '%s' iniciada el %s por %s" % (es['fase'], es['inicio'], es['tecnico']))
+            if u['Instalado'] and not u['FiltroActual']:
+                lineas.append('Mantenimiento       : EN CURSO (proteccion desactivada)')
             else:
                 lineas.append('Mantenimiento       : ninguno en curso')
             lineas.append('Cambios pendientes  : %s' % (
@@ -1996,19 +1811,20 @@ def mostrar_interfaz():
                 barra_overlay['maximum'] = int(u['OverlayMaxMB'])
                 barra_overlay['value'] = min(int(u['OverlayUsoMB']), int(u['OverlayMaxMB']))
 
-            # Banner
-            fase_abierta = es.get('fase') if es else None
-            if fase_abierta in ('mantenimiento', 'aplicando') and not u['FiltroActual']:
-                banner.config(bg=ROJO); lbl_banner.config(bg=ROJO,
-                    text=('APLICANDO CAMBIOS PENDIENTES  -  EL EQUIPO NO ESTA PROTEGIDO'
-                          if fase_abierta == 'aplicando'
-                          else 'MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO'))
+            # Banner. Nadie reactiva la proteccion por su cuenta, asi que con el filtro
+            # desactivado el aviso es rojo hasta que el tecnico pulse "Finalizar".
+            if not u['Instalado']:
+                banner.config(bg=NARANJA); lbl_banner.config(bg=NARANJA,
+                    text='UWF NO ESTA INSTALADO  -  el equipo no esta protegido')
             elif u['FiltroActual']:
                 banner.config(bg=VERDE); lbl_banner.config(bg=VERDE,
                     text='PROTECCION ACTIVA  -  los cambios se descartan al reiniciar')
-            else:
+            elif u['FiltroSiguiente']:
                 banner.config(bg=NARANJA); lbl_banner.config(bg=NARANJA,
-                    text='PROTECCION DESACTIVADA  -  los cambios se guardan en disco')
+                    text='PROTECCION DESACTIVADA  -  se reactivara al reiniciar')
+            else:
+                banner.config(bg=ROJO); lbl_banner.config(bg=ROJO,
+                    text='MANTENIMIENTO EN CURSO  -  EL EQUIPO NO ESTA PROTEGIDO hasta pulsar "Finalizar"')
 
             lbl_fase.config(text=lbl_banner.cget('text'))
             btn_iniciar_m.config(state='normal' if (u['Instalado'] and u['FiltroActual']) else 'disabled')
@@ -2036,8 +1852,8 @@ def mostrar_interfaz():
                 if u['FiltroActual']:
                     lbl_ov_estado.config(fg=AMBAR,
                         text='La proteccion esta ACTIVA: el tamano y el sitio no se pueden cambiar ahora. '
-                             'Si los cambias, al aplicar se abrira la ventana de mantenimiento sola y el '
-                             'equipo se reiniciara dos veces.')
+                             'Si los cambias, se quedaran pendientes hasta que inicies un mantenimiento '
+                             'y pulses "Finalizar".')
                 else:
                     lbl_ov_estado.config(fg=VERDE,
                         text='La proteccion esta desactivada: se puede cambiar todo. '
@@ -2175,8 +1991,6 @@ def mostrar_interfaz():
             r = invoke_uwf(['filter', 'enable'])
             if not r['Ok']:
                 raise RuntimeError('No se ha podido activar el filtro:\n\n%s' % r['Salida'])
-            # Como cualquier activacion del filtro, el vigilante lo confirma en el arranque
-            guardar_estado('verificando')
             escribir_log('PrepararEquipo', 'OK' if not errores else 'PARCIAL',
                          '%d avisos' % len(errores))
             form.config(cursor='')
@@ -2289,11 +2103,11 @@ def mostrar_interfaz():
         detalle = '\n'.join('  - ' + l for l in resumen_pendientes(p))
         aviso = 'Se van a aplicar estos cambios:\n\n%s\n\n' % detalle
         if requiere_off:
-            aviso += ('Cambiar el tamano o el sitio exige desactivar la proteccion, asi que el equipo se\n'
-                      'reiniciara DOS veces: la primera para aplicarlo sin proteccion y la segunda para\n'
-                      'volver a protegerlo. No hay que hacer nada entre medias.\n\nContinuar?')
+            aviso += ('El tamano y el sitio del uso del disco solo pueden cambiarse sin proteccion: se\n'
+                      'quedaran pendientes hasta que inicies un mantenimiento y pulses "Finalizar".\n'
+                      'El resto se aplica ahora y surte efecto al reiniciar.\n\nContinuar?')
         else:
-            aviso += 'El equipo se reiniciara una vez para que surtan efecto.\n\nContinuar?'
+            aviso += 'Surtiran efecto al reiniciar el equipo.\n\nContinuar?'
         if not messagebox.askyesno('UWF Aulas', aviso):
             return
 
@@ -2304,11 +2118,7 @@ def mostrar_interfaz():
             refrescar()
             if res['Errores']:
                 messagebox.showwarning('UWF Aulas', 'Aplicado con avisos:\n\n' + '\n'.join(res['Errores']))
-            if requiere_off and res['EsperandoFiltroOff']:
-                iniciar_aplicacion_pendientes()
-                refrescar()
-                reiniciar_equipo('aplicar cambios pendientes sin proteccion')
-            elif res['Aplicados']:
+            if res['Aplicados']:
                 preguntar_reinicio('cambios pendientes aplicados')
         except Exception as ex:
             form.config(cursor='')
@@ -2433,17 +2243,31 @@ def mostrar_interfaz():
             messagebox.showerror('Error', str(ex))
 
     def on_finalizar_m():
-        """Boton '3 - Finalizar, proteger y reiniciar'."""
+        """Boton '3 - Finalizar, proteger y reiniciar': aplica la cola, protege y reinicia."""
+        lineas_pend = resumen_pendientes(leer_pendientes())
+        if lineas_pend and not messagebox.askyesno('UWF Aulas',
+                'Antes de proteger el equipo se aplicaran estos cambios pendientes:\n\n%s\n\n'
+                'Despues se reactiva la proteccion y se reinicia. Continuar?'
+                % '\n'.join('  - ' + l for l in lineas_pend)):
+            return
         try:
-            finalizar_mantenimiento(); refrescar(); reiniciar_equipo('cierre de mantenimiento')
+            form.config(cursor='watch'); form.update_idletasks()
+            res = finalizar_mantenimiento()
+            form.config(cursor='')
+            refrescar()
+            if res['Errores']:
+                messagebox.showwarning('UWF Aulas',
+                    'La proteccion se ha reactivado, pero algunos cambios pendientes han fallado y '
+                    'siguen en la cola:\n\n' + '\n'.join(res['Errores']))
+            reiniciar_equipo('cierre de mantenimiento')
         except Exception as ex:
+            form.config(cursor='')
             messagebox.showerror('Error', str(ex))
 
     def on_guardar_cfg():
         """Boton 'Guardar configuracion' de la pestana Configuracion."""
         try:
-            guardar_config({'rutaLogRed': txt_red.get().strip(),
-                            'horasMaxMantenimiento': int(num_horas.get())})
+            guardar_config({'rutaLogRed': txt_red.get().strip()})
             lbl_barra.config(text='Configuracion guardada')
         except Exception as ex:
             messagebox.showerror('Error', str(ex))
@@ -2476,10 +2300,8 @@ def mostrar_interfaz():
     # Carga inicial
     cfg = leer_config()
     txt_red.insert(0, str(cfg.get('rutaLogRed', '')))
-    _set_spin(num_horas, int(cfg['horasMaxMantenimiento']) if cfg.get('horasMaxMantenimiento') else 8)
 
-    estado_actual = leer_estado()
-    if estado_actual and estado_actual.get('fase') in ('mantenimiento', 'aplicando'):
+    if test_uwf_instalado() and not filtro_activo_ahora():
         tabs.select(tab_mant)
 
     refrescar()
@@ -2491,7 +2313,7 @@ def mostrar_interfaz():
 # =============================================================================
 
 def _es_vigilante(argv):
-    """True si los argumentos de linea de comandos piden el modo vigilante (sin interfaz)."""
+    """True si lo lanza la tarea de arranque de una version anterior (--vigilante)."""
     return any(a.lower() in ('--vigilante', '-vigilante', '/vigilante') for a in argv)
 
 
@@ -2509,18 +2331,17 @@ def _avisar(mensaje):
 
 
 def main(argv=None):
-    """Punto de entrada: modo vigilante si se pide por argumento, si no comprueba privilegios,
-    hace la autoinstalacion (tarea programada + acceso directo) y muestra la GUI."""
+    """Punto de entrada: comprueba privilegios, hace la autoinstalacion (copia en ProgramData
+    y acceso directo) y muestra la GUI."""
     if argv is None:
         argv = sys.argv[1:]
 
     inicializar_carpeta()
 
     if _es_vigilante(argv):
-        try:
-            ejecutar_vigilante()
-        except Exception as ex:
-            escribir_log('Vigilante', 'ERROR', str(ex))
+        # El modo vigilante ya no existe. Si la tarea de una version anterior sigue
+        # registrada, se borra y se sale sin tocar el filtro.
+        eliminar_tarea_antigua()
         return 0
 
     if not test_administrador():
@@ -2531,19 +2352,17 @@ def main(argv=None):
         guardar_perfil(get_perfil_predeterminado())
 
     try:
-        instalar_vigilante()
+        instalar_copia()
         crear_acceso_directo()
     except Exception as ex:
         escribir_log('Autoinstalacion', 'ERROR', str(ex))
-        # No basta con dejarlo en el log: si la copia de ProgramData se ha quedado en una
-        # version anterior, el vigilante que corre al arrancar no conoce la fase 'aplicando'
-        # y un equipo podria quedarse sin proteccion. El tecnico tiene que saberlo.
+        # No basta con dejarlo en el log: el acceso directo seguiria abriendo la version
+        # anterior y el tecnico no sabria por que.
         _avisar(
             'No se ha podido actualizar la copia instalada en\n%s\n\n%s\n\n'
-            'La herramienta se abrira igualmente, pero NO uses "Aplicar cambios y reiniciar" '
-            'hasta resolverlo: el vigilante que arranca con el equipo seguiria siendo el '
-            'anterior. Cierra la herramienta, espera unos segundos tras el arranque y vuelve '
-            'a ejecutarla.' % (ScriptDest, ex)
+            'La herramienta se abrira igualmente, pero el acceso directo del escritorio '
+            'seguira abriendo la version anterior. Cierra las demas ventanas de la '
+            'herramienta y vuelve a ejecutar esta.' % (ScriptDest, ex)
         )
 
     mostrar_interfaz()

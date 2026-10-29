@@ -1,6 +1,6 @@
 ---
 name: revisor-uwf
-description: Revisor de código especializado en los invariantes de UWF Aulas (rutas prohibidas, umbrales de overlay, WMI vs uwfmgr, estado del filtro, vigilante, privilegios). Úsalo antes de dar por buena cualquier modificación de UWF-Aulas.ps1 o UWF-Aulas.py, y cuando se pregunte si un cambio puede dejar un equipo del aula sin protección o romper Windows Update.
+description: Revisor de código especializado en los invariantes de UWF Aulas (rutas prohibidas, umbrales de overlay, WMI vs uwfmgr, estado del filtro, persistencia, privilegios). Úsalo antes de dar por buena cualquier modificación de UWF-Aulas.ps1 o UWF-Aulas.py, y cuando se pregunte si un cambio puede dejar un equipo del aula sin protección o romper Windows Update.
 tools: Read, Grep, Glob
 ---
 
@@ -34,14 +34,16 @@ aulas a la vez.
    `UWF_Overlay`). **Parsear la salida de texto de `uwfmgr` es un fallo**: cambia con el
    idioma del sistema. Único parseo tolerado: el fallback de consumo documentado en
    `Get-EstadoUwf`.
-5. **El equipo nunca se queda desprotegido sin red de seguridad.** Cualquier camino que
-   haga `filter disable` tiene que dejar `estado.json` escrito **antes o junto** al
-   cambio, y cualquier `filter enable` debe dejar la fase en `verificando` para que el
-   vigilante confirme en el siguiente arranque. Busca caminos de error que desactiven el
-   filtro y salgan sin registrar estado.
-6. **Vigilante.** Corre como SYSTEM al arranque, sin interfaz. Nada de diálogos,
-   `Read-Host`, `input()`, ni `messagebox` en su ruta de ejecución. El tope
-   `horasMaxMantenimiento` (por defecto 8) debe seguir reactivando la protección sola.
+5. **El filtro solo lo activa y desactiva el técnico.** No hay vigilante ni tarea de
+   arranque (se quitó a propósito: no debe volver). `filter disable` solo sale del botón
+   *Iniciar mantenimiento*; `filter enable`, de *Finalizar* y *Preparar equipo*.
+   *Finalizar* reactiva el filtro aunque falle la cola de pendientes. Mientras el filtro
+   está desactivado la GUI lo avisa en rojo.
+6. **Persistencia con el filtro activo.** `C:\ProgramData\UWF-Aulas\` no es una exclusión:
+   todo fichero que la herramienta necesite tras reiniciar (cola, configuración, copia
+   instalada, acceso directo) se pasa por `persistir_en_disco` / `Persistir-EnDisco`
+   (`uwfmgr file commit` / `commit-delete`) al escribirlo o borrarlo. Un fichero nuevo que
+   se escriba sin eso se pierde en el siguiente reinicio.
 7. **Privilegios y elevación.** Las acciones sobre UWF exigen admin; comprueba que se
    verifica antes y que el fallo es explícito, no un error críptico de `uwfmgr`.
 8. **Logs.** Toda acción relevante pasa por `Escribir-Log 'Accion' 'Resultado' 'detalle'`

@@ -36,13 +36,13 @@ comentarios `# ----- / # =====`. Convención de nombres: `Verbo-Sustantivo` en P
 | Exclusiones | `Normalizar-ClaveRegistro`, `Test-ExclusionPeligrosa`, `Get-/Add-/Remove-Exclusion*` | `normalizar_clave_registro`, `test_exclusion_peligrosa`, `get_/add_/remove_exclusion_*` |
 | Programas | `Get-ProgramasInstalados`, `Resolver-Glob`, `Get-PropuestasExclusion` | `get_programas_instalados`, `resolver_glob`, `get_propuestas_exclusion` (+ `_abrir_hklm`, `_valor`, `existe_clave_hklm`) |
 | Perfiles | `Get-PerfilPredeterminado`, `Leer-Perfil`, `Guardar-Perfil`, `Aplicar-Perfil` | `get_perfil_predeterminado`, `leer_perfil`, `guardar_perfil`, `aplicar_perfil` |
-| Instalación | `Instalar-Vigilante`, `Crear-AccesoDirecto` | `instalar_vigilante`, `crear_acceso_directo` (+ `_pythonw`, `_script_origen`, `_accion_lanzamiento`) |
-| Mantenimiento | `Iniciar-Mantenimiento`, `Finalizar-Mantenimiento`, `Iniciar-AplicacionPendientes`, `Reiniciar-Equipo` | `iniciar_mantenimiento`, `finalizar_mantenimiento`, `iniciar_aplicacion_pendientes`, `reiniciar_equipo` |
-| Vigilante | `Ejecutar-Vigilante` | `ejecutar_vigilante` |
+| Persistencia | `Test-FiltroActivoAhora`, `Persistir-EnDisco` | `filtro_activo_ahora`, `persistir_en_disco` |
+| Instalación | `Instalar-Copia`, `Eliminar-TareaAntigua`, `Crear-AccesoDirecto` | `instalar_copia`, `eliminar_tarea_antigua`, `crear_acceso_directo` (+ `_pythonw`, `_script_origen`) |
+| Mantenimiento | `Iniciar-Mantenimiento`, `Finalizar-Mantenimiento`, `Reiniciar-Equipo` | `iniciar_mantenimiento`, `finalizar_mantenimiento`, `reiniciar_equipo` |
 | GUI | `Mostrar-DialogoPrograma`, `Mostrar-Interfaz` | `mostrar_dialogo_programa`, `mostrar_interfaz` |
 
 **Estado a 27/10/2026**: las dos implementaciones están sincronizadas, incluida la **cola de
-cambios pendientes** (región Pendientes, `pendientes.json`, fase `aplicando` del vigilante,
+cambios pendientes** (región Pendientes, `pendientes.json`,
 barra de pendientes en la GUI y el renombrado de la pestaña Overlay a "Uso del disco"). El
 comportamiento acordado está descrito en el encabezado `Cambios v3` de ambos ficheros.
 
@@ -82,7 +82,7 @@ instalación de la característica UWF está dentro de la GUI; en Python está e
   `fecha;equipo;usuario;accion;resultado;detalle`) solo en una de las dos versiones: los
   dos escriben en el mismo fichero central de red.
 - Los nombres de `accion` que se escriben en el log, las claves de `config.json`,
-  `estado.json` y `perfil-exclusiones.json` **deben ser idénticos byte a byte** entre
+  `pendientes.json` y `perfil-exclusiones.json` **deben ser idénticos byte a byte** entre
   ambas versiones: un equipo puede pasar del `.ps1` al `.exe` y leer el estado del otro.
 - Identificadores y mensajes de log en español **sin acentos** (ASCII). Los textos de la
   GUI sí llevan acentos.
