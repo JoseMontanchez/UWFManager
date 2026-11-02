@@ -54,6 +54,11 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 
   La proteccion **no vuelve sola**: hasta pulsar *Finalizar*, el equipo sigue sin proteger y
   la interfaz lo avisa en rojo. No hay ningun proceso en segundo plano.
+- **Actualizacion automatica**: cada vez que se abre la herramienta, mira en segundo plano la
+  [ultima release](https://github.com/JoseMontanchez/UWFManager/releases) y, si es mas nueva,
+  la descarga, comprueba su SHA-256 y sustituye la copia instalada sin molestar al tecnico. La
+  version nueva se usa la proxima vez que se abra. Solo funciona con la ventana abierta: no hay
+  tarea programada ni servicio.
 - **Registro**: cada accion queda en un log CSV local (`C:\ProgramData\UWF-Aulas\uwf-aulas.log`)
   y, si se configura una ruta de red, tambien en un log centralizado por mes.
 
@@ -68,6 +73,7 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 | `docs/FUNCIONAMIENTO.md` | Documentacion del funcionamiento interno. |
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
 | `version_info.txt` | Datos de version del `.exe` (Propiedades > Detalles). |
+| `Comprobar-Release.ps1` | Escanea el `.exe` con Defender antes de publicarlo y muestra su SHA-256. |
 | `.claude/agents/` | Agentes de Claude Code del proyecto: paridad entre las dos implementaciones, revision de los invariantes de UWF, catalogo de exclusiones y empaquetado. |
 
 Estado que la herramienta guarda en el equipo, en `C:\ProgramData\UWF-Aulas\`:
@@ -82,7 +88,9 @@ cambios sin aplicar) y `uwf-aulas.log`.
   - Borra la tarea programada `UWF-Aulas-Vigilante` que registraban las versiones
     anteriores, si existe.
   - Crea el acceso directo `UWF Aulas.lnk` en el escritorio publico.
-- **Actualizar un equipo** es, por tanto, solo ejecutar la version nueva: compara por hash la
+- **Actualizar un equipo** es automatico desde la v6 (ver *Que hace* y
+  [Publicar una version](#publicar-una-version)). Tambien se puede actualizar a mano, ejecutando
+  la version nueva: compara por hash la
   copia instalada con la que se esta ejecutando y la sustituye si difieren. Como Windows no
   deja sobrescribir un ejecutable en uso, si esta abierto aparta el anterior a un
   `.old-<fecha>` que borra en la siguiente ejecucion. Si aun asi no pudiera sustituirlo,
@@ -111,3 +119,41 @@ evita que la linea de compilacion y lo versionado se separen.
 El resultado queda en `dist\UWFManager.exe`: un unico ejecutable, sin necesitar Python
 instalado en el equipo destino, que pide elevacion automaticamente al abrirse. El `.exe`
 no se versiona en el repositorio.
+
+## Publicar una version
+
+Los equipos se actualizan solos a partir de la release marcada como *Latest*, asi que lo que se
+publique llega a todas las aulas. Para sacar la version `N`:
+
+1. Sube el numero en `Version` (`UWF-Aulas.py`), `$script:Version` (`UWF-Aulas.ps1`) y
+   `version_info.txt`.
+2. Compila el `.exe` y ejecuta `.\Comprobar-Release.ps1` en un equipo con Defender activo.
+3. Crea en GitHub la release con la etiqueta `vN` (`v7` o `v7.1`), marcada como *pre-release*,
+   y adjunta **`UWFManager.exe`** y **`UWF-Aulas.ps1`** con esos nombres exactos. Si falta uno,
+   los equipos que usen esa version siguen como estan y lo anotan en el log
+   (`BuscarActualizacion;ERROR`).
+4. Envia el `.exe` a Microsoft (ver abajo) y pruebalo en un equipo a mano.
+5. Cuando este limpio, marca la release como *Latest*: en ese momento empieza a llegar a las
+   aulas. Una *pre-release* queda fuera de la actualizacion automatica.
+
+### Falso positivo de Defender (`Program:Win32/Contebrew.A!ml`)
+
+El sufijo `!ml` indica que lo clasifica un modelo de aprendizaje automatico, no una firma de
+malware conocido. Microsoft no publica que lo activa, asi que ningun cambio en la compilacion
+garantiza evitarlo. El `.spec` ya evita UPX e incluye datos de version.
+
+Lo que hay que hacer con cada version, porque cada compilacion tiene un hash nuevo:
+
+1. Entra en [Submit a file for malware analysis](https://www.microsoft.com/en-us/wdsi/filesubmission)
+   con la misma cuenta en cada envio.
+2. Envia `UWFManager.exe` como desarrollador de software, indicando que esta mal clasificado
+   ("should not be detected"), con el nombre de la deteccion y una descripcion de la herramienta.
+3. Sigue el resultado en el historial de envios de esa cuenta y comprueba con
+   `Comprobar-Release.ps1` cuando se hayan actualizado las definiciones.
+
+Firmar el `.exe` con un certificado de firma de codigo ayuda a ganar reputacion, y ademas
+permitiria comprobar la firma al actualizar, aunque no garantiza que desaparezca la deteccion.
+
+La herramienta **no** anade exclusiones de Defender ni oculta su contenido: dejaria sin
+proteccion los equipos del aula y es justo lo que hace el malware. Si el centro necesita
+permitirla, debe hacerlo su administrador por politica.

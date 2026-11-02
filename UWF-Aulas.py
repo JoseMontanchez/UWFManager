@@ -21,6 +21,11 @@ Cambios v3:
   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
     claves de los perfiles JSON) se conserva el termino de UWF.
 
+Cambios v6:
+  - Actualizacion automatica: al abrir la GUI, un hilo mira la ultima release de GitHub y,
+    si es mas nueva, la descarga, comprueba su SHA-256 y sustituye la copia instalada. Se
+    usa la proxima vez que se abra. No hay tarea programada: sin la GUI abierta no corre nada.
+
 Notas del port:
   - Para leer el estado de UWF se usa WMI (root\\standardcimv2\\embedded) via el
     modulo 'wmi'. Para actuar se usa uwfmgr.exe. No se parsea la salida de
@@ -36,10 +41,14 @@ import re
 import sys
 import glob
 import json
+import uuid
+import queue
 import socket
 import shutil
 import hashlib
+import threading
 import subprocess
+import urllib.request
 from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 
@@ -64,6 +73,9 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
+Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+UrlRelease = 'https://api.github.com/repos/JoseMontanchez/UWFManager/releases/latest'
+AssetRelease = 'UWFManager.exe'        # fichero de la release que sustituye a la copia instalada
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
 Prohibidas = [
@@ -1165,13 +1177,14 @@ def eliminar_tarea_antigua():
 
 
 def _limpiar_restos():
-    """Borra los apartados .old-* de sustituciones anteriores y el .py suelto que pudiera
-    haber dejado una instalacion de desarrollo cuando ahora se ejecuta el .exe."""
+    """Borra los apartados .old-* de sustituciones anteriores, las descargas .nuevo-* que no
+    llegaron a instalarse y el .py suelto que pudiera haber dejado una instalacion de
+    desarrollo cuando ahora se ejecuta el .exe."""
     borrados = []
     try:
         for nombre in os.listdir(Base):
             ruta = os.path.join(Base, nombre)
-            if '.old-' in nombre and os.path.isfile(ruta):
+            if ('.old-' in nombre or '.nuevo-' in nombre) and os.path.isfile(ruta):
                 try:
                     os.remove(ruta)
                     borrados.append(nombre)
@@ -1239,9 +1252,89 @@ def instalar_copia():
             # Con la proteccion activa la copia nueva se perderia al reiniciar
             persistir_en_disco(ScriptDest)
             escribir_log('ActualizarInstalacion', 'OK', '%s: %s' % (accion, detalle))
-        restos = _limpiar_restos()
-        if restos:
-            escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
+    # Fuera del if: tras una actualizacion automatica se arranca desde la propia copia instalada
+    restos = _limpiar_restos()
+    if restos:
+        escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
+
+
+def _numero_version(texto):
+    """Convierte 'v6' o '6.1' en una lista comparable de cuatro numeros ([6, 1, 0, 0])."""
+    m = re.match(r'^[vV]?(\d+(?:\.\d+){0,3})$', str(texto).strip())
+    if not m:
+        raise ValueError('Etiqueta de version no reconocida: %s' % texto)
+    numeros = [int(n) for n in m.group(1).split('.')]
+    return numeros + [0] * (4 - len(numeros))
+
+
+def buscar_actualizacion():
+    """Mira la ultima release de GitHub y, si es mas nueva, la descarga junto a la copia
+    instalada. Corre en un hilo: no toca la GUI, ni UWF, ni el log.
+
+    Devuelve {Etiqueta, Fichero}, o None si no hay nada que actualizar. La descarga no se da
+    por buena hasta que coincide con el SHA-256 que publica GitHub. Comparar tambien la huella
+    evita descargarla en cada arranque si una release se compila sin subir Version.
+    """
+    cabeceras = {'User-Agent': 'UWFManager', 'Accept': 'application/vnd.github+json'}
+    with urllib.request.urlopen(urllib.request.Request(UrlRelease, headers=cabeceras),
+                                timeout=20) as resp:
+        release = json.load(resp)
+
+    etiqueta = release.get('tag_name', '')
+    if _numero_version(etiqueta) <= _numero_version(Version):
+        return None
+
+    asset = next((a for a in (release.get('assets') or []) if a.get('name') == AssetRelease), None)
+    if not asset:
+        raise RuntimeError('la release %s no trae %s' % (etiqueta, AssetRelease))
+    digest = (asset.get('digest') or '').lower()
+    if not digest.startswith('sha256:'):
+        raise RuntimeError('la release %s no publica el SHA-256 de %s' % (etiqueta, AssetRelease))
+    huella = digest[len('sha256:'):]
+    if os.path.isfile(ScriptDest) and _huella(ScriptDest) == huella:
+        return None
+
+    nuevo = '%s.nuevo-%s' % (ScriptDest, uuid.uuid4().hex[:8])
+    try:
+        pet = urllib.request.Request(asset['browser_download_url'], headers=cabeceras)
+        with urllib.request.urlopen(pet, timeout=60) as resp, open(nuevo, 'wb') as fh:
+            shutil.copyfileobj(resp, fh, 65536)
+        if _huella(nuevo) != huella:
+            raise RuntimeError('el SHA-256 de la descarga de %s no coincide' % etiqueta)
+    except Exception:
+        try:
+            os.remove(nuevo)
+        except OSError:
+            pass
+        raise
+    return {'Etiqueta': etiqueta, 'Fichero': nuevo}
+
+
+def instalar_actualizacion(nueva):
+    """Pone en su sitio lo descargado por buscar_actualizacion. Renombra en vez de copiar para
+    que un corte a medias no deje un ejecutable roto. Si la copia esta en uso se aparta a un
+    '.old-<fecha>', igual que en reemplazar_instalado."""
+    fichero = nueva['Fichero']
+    try:
+        try:
+            os.replace(fichero, ScriptDest)
+        except OSError:
+            apartado = '%s.old-%s' % (ScriptDest, _now('%Y%m%d%H%M%S'))
+            os.replace(ScriptDest, apartado)
+            try:
+                os.replace(fichero, ScriptDest)
+            except OSError:
+                os.replace(apartado, ScriptDest)
+                raise
+    except Exception:
+        try:
+            os.remove(fichero)
+        except OSError:
+            pass
+        raise
+    # Con la proteccion activa la copia nueva se perderia al reiniciar
+    persistir_en_disco(ScriptDest)
+    escribir_log('ActualizarInstalacion', 'OK', 'actualizacion automatica a %s' % nueva['Etiqueta'])
 
 
 def crear_acceso_directo():
@@ -1561,7 +1654,7 @@ def mostrar_interfaz():
     ROJO_FILA = '#A03C3C'
 
     form = tk.Tk()
-    form.title('UWF Aulas v2  -  %s' % os.environ.get('COMPUTERNAME', socket.gethostname()))
+    form.title('UWF Aulas v%s  -  %s' % (Version, os.environ.get('COMPUTERNAME', socket.gethostname())))
     form.geometry('940x700')
     form.minsize(820, 620)
     try:
@@ -2304,7 +2397,37 @@ def mostrar_interfaz():
     if test_uwf_instalado() and not filtro_activo_ahora():
         tabs.select(tab_mant)
 
+    # Actualizacion automatica. La red va en un hilo para no bloquear la ventana; instalar y
+    # escribir en el log se hacen aqui, en el hilo de la GUI, porque usan WMI y uwfmgr. El .py
+    # sin compilar no se actualiza: la release solo trae el .exe.
+    buzon = queue.Queue()
+
+    def hilo_actualizacion():
+        try:
+            buzon.put((buscar_actualizacion(), None))
+        except Exception as ex:
+            buzon.put((None, ex))
+
+    def recoger_actualizacion():
+        try:
+            nueva, error = buzon.get_nowait()
+        except queue.Empty:
+            form.after(1000, recoger_actualizacion)
+            return
+        try:
+            if error:
+                raise error
+            if nueva:
+                instalar_actualizacion(nueva)
+                lbl_barra.config(text='Actualizada a %s: se usara la proxima vez que se abra la '
+                                      'herramienta' % nueva['Etiqueta'])
+        except Exception as ex:
+            escribir_log('BuscarActualizacion', 'ERROR', ' '.join(str(ex).replace(';', ',').split()))
+
     refrescar()
+    if Congelado:
+        threading.Thread(target=hilo_actualizacion, daemon=True).start()
+        form.after(1000, recoger_actualizacion)
     form.mainloop()
 
 

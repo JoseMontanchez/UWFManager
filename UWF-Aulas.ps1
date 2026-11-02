@@ -22,6 +22,12 @@
 #     en la cola hasta que el tecnico pulsa "Finalizar" durante un mantenimiento.
 #   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
 #     claves de los perfiles JSON) se conserva el termino de UWF.
+#
+#  Cambios v6:
+#   - Actualizacion automatica: al abrir la GUI, un runspace mira la ultima release de
+#     GitHub y, si es mas nueva, la descarga, comprueba su SHA-256 y sustituye la copia
+#     instalada. Se usa la proxima vez que se abra. No hay tarea programada: sin la GUI
+#     abierta no corre nada.
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -35,6 +41,9 @@ $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
 $script:TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
+$script:Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+$script:UrlRelease = 'https://api.github.com/repos/JoseMontanchez/UWFManager/releases/latest'
+$script:AssetRelease = 'UWF-Aulas.ps1'         # fichero de la release que sustituye a la copia instalada
 $script:Caracteristica = 'Client-UnifiedWriteFilter'
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
@@ -916,11 +925,12 @@ function Eliminar-TareaAntigua {
 }
 
 function Limpiar-Restos {
-    # Borra los apartados .old-* de sustituciones anteriores.
+    # Borra los apartados .old-* de sustituciones anteriores y las descargas .nuevo-* que no
+    # llegaron a instalarse.
     $borrados = New-Object System.Collections.ArrayList
     try {
         foreach ($f in @(Get-ChildItem -LiteralPath $script:Base -File -ErrorAction SilentlyContinue)) {
-            if ($f.Name -like '*.old-*') {
+            if (($f.Name -like '*.old-*') -or ($f.Name -like '*.nuevo-*')) {
                 try {
                     Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
                     [void]$borrados.Add($f.Name)
@@ -978,9 +988,88 @@ function Instalar-Copia {
             Persistir-EnDisco $script:ScriptDest
             Escribir-Log 'ActualizarInstalacion' 'OK' "$($res[0]): $($res[1])"
         }
-        $restos = @(Limpiar-Restos)
-        if ($restos.Count) { Escribir-Log 'LimpiarRestos' 'OK' ($restos -join ', ') }
     }
+    # Fuera del if: tras una actualizacion automatica se arranca desde la propia copia instalada
+    $restos = @(Limpiar-Restos)
+    if ($restos.Count) { Escribir-Log 'LimpiarRestos' 'OK' ($restos -join ', ') }
+}
+
+# Mira la ultima release de GitHub y, si es mas nueva, la descarga junto a la copia instalada.
+# Corre en otro runspace: no ve las funciones de este script y no toca la GUI, ni UWF, ni el log.
+#
+# Devuelve @{Etiqueta; Fichero}, o nada si no hay nada que actualizar. La descarga no se da por
+# buena hasta que coincide con el SHA-256 que publica GitHub. Comparar tambien la huella evita
+# descargarla en cada arranque si una release se compila sin subir la version.
+$script:BuscarActualizacion = {
+    param([string]$Version, [string]$UrlRelease, [string]$AssetRelease, [string]$ScriptDest)
+    $ErrorActionPreference = 'Stop'
+
+    function Get-NumeroVersion([string]$Texto) {
+        # Convierte 'v6' o '6.1' en una version comparable de cuatro numeros (6.1.0.0)
+        if ($Texto.Trim() -notmatch '^[vV]?(\d+(\.\d+){0,3})$') {
+            throw "Etiqueta de version no reconocida: $Texto"
+        }
+        $numeros = @($Matches[1].Split('.'))
+        while ($numeros.Count -lt 4) { $numeros += '0' }
+        return [version]($numeros -join '.')
+    }
+
+    # PowerShell 5.1 no activa TLS 1.2 por defecto y GitHub no acepta nada inferior
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $release  = Invoke-RestMethod -Uri $UrlRelease -TimeoutSec 20 -UseBasicParsing `
+                    -UserAgent 'UWFManager' -Headers @{ Accept = 'application/vnd.github+json' }
+    $etiqueta = [string]$release.tag_name
+    if ((Get-NumeroVersion $etiqueta) -le (Get-NumeroVersion $Version)) { return }
+
+    $asset = @($release.assets | Where-Object { $_.name -ceq $AssetRelease }) | Select-Object -First 1
+    if (-not $asset) { throw "la release $etiqueta no trae $AssetRelease" }
+    $digest = ([string]$asset.digest).ToLower()
+    if (-not $digest.StartsWith('sha256:')) { throw "la release $etiqueta no publica el SHA-256 de $AssetRelease" }
+    $huella = $digest.Substring('sha256:'.Length)
+    if ((Test-Path -LiteralPath $ScriptDest) -and
+        ((Get-FileHash -LiteralPath $ScriptDest -Algorithm SHA256).Hash -eq $huella)) { return }
+
+    $nuevo = "$ScriptDest.nuevo-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    $web = New-Object System.Net.WebClient
+    try {
+        $web.Headers.Add('User-Agent', 'UWFManager')
+        $web.DownloadFile([string]$asset.browser_download_url, $nuevo)
+        if ((Get-FileHash -LiteralPath $nuevo -Algorithm SHA256).Hash -ne $huella) {
+            throw "el SHA-256 de la descarga de $etiqueta no coincide"
+        }
+    } catch {
+        Remove-Item -LiteralPath $nuevo -Force -ErrorAction SilentlyContinue
+        throw
+    } finally { $web.Dispose() }
+    return @{ Etiqueta = $etiqueta; Fichero = $nuevo }
+}
+
+function Instalar-Actualizacion($nueva) {
+    # Pone en su sitio lo descargado por BuscarActualizacion. Renombra en vez de copiar para que
+    # un corte a medias no deje la copia rota. Si no se puede sustituir se aparta a un
+    # '.old-<fecha>', igual que en Reemplazar-Instalado.
+    $fichero = $nueva.Fichero
+    try {
+        try {
+            Move-Item -LiteralPath $fichero -Destination $script:ScriptDest -Force -ErrorAction Stop
+        } catch {
+            $apartado = "$($script:ScriptDest).old-$(Get-Date -Format 'yyyyMMddHHmmss')"
+            Move-Item -LiteralPath $script:ScriptDest -Destination $apartado -Force -ErrorAction Stop
+            try {
+                Move-Item -LiteralPath $fichero -Destination $script:ScriptDest -Force -ErrorAction Stop
+            } catch {
+                Move-Item -LiteralPath $apartado -Destination $script:ScriptDest -Force -ErrorAction Stop
+                throw
+            }
+        }
+    } catch {
+        Remove-Item -LiteralPath $fichero -Force -ErrorAction SilentlyContinue
+        throw
+    }
+    # Con la proteccion activa la copia nueva se perderia al reiniciar
+    Persistir-EnDisco $script:ScriptDest
+    Escribir-Log 'ActualizarInstalacion' 'OK' "actualizacion automatica a $($nueva.Etiqueta)"
 }
 
 function Crear-AccesoDirecto {
@@ -1243,7 +1332,7 @@ function Mostrar-DialogoPrograma {
 function Mostrar-Interfaz {
 
     $form                 = New-Object System.Windows.Forms.Form
-    $form.Text            = "UWF Aulas v2  -  $env:COMPUTERNAME"
+    $form.Text            = "UWF Aulas v$($script:Version)  -  $env:COMPUTERNAME"
     $form.Size            = New-Object System.Drawing.Size(940, 730)
     $form.StartPosition   = 'CenterScreen'
     $form.Font            = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -2119,8 +2208,37 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
 
     if ((Test-UwfInstalado) -and -not (Test-FiltroActivoAhora)) { $tabs.SelectedTab = $tabMant }
 
+    # Actualizacion automatica. La red va en un runspace para no bloquear la ventana; instalar y
+    # escribir en el log se hacen en el temporizador, en el hilo de la GUI.
+    $psAct = [powershell]::Create()
+    [void]$psAct.AddScript($script:BuscarActualizacion.ToString()).AddArgument($script:Version).
+        AddArgument($script:UrlRelease).AddArgument($script:AssetRelease).AddArgument($script:ScriptDest)
+    $tmrAct = New-Object System.Windows.Forms.Timer
+    $tmrAct.Interval = 1000
+    $tmrAct.Add_Tick({
+        if (-not $asyncAct.IsCompleted) { return }
+        $tmrAct.Stop()
+        try {
+            $res = @($psAct.EndInvoke($asyncAct))
+            if ($res.Count) {
+                Instalar-Actualizacion $res[0]
+                $lblBarra.Text = "Actualizada a $($res[0].Etiqueta): se usara la proxima vez que se abra la herramienta"
+            }
+        } catch {
+            # EndInvoke envuelve el error del runspace: el motivo real es la excepcion interna
+            $ex = $_.Exception
+            if ($ex.InnerException) { $ex = $ex.InnerException }
+            Escribir-Log 'BuscarActualizacion' 'ERROR' ((($ex.Message -replace ';', ',') -split '\s+') -join ' ')
+        }
+    })
+
     & $refrescar
+    $asyncAct = $psAct.BeginInvoke()
+    $tmrAct.Start()
     [void]$form.ShowDialog()
+    # Si la ventana se cierra a media descarga no se espera: se repite la proxima vez
+    $tmrAct.Stop()
+    if (-not $asyncAct.IsCompleted) { [void]$psAct.BeginStop($null, $null) }
 }
 
 # -----------------------------------------------------------------------------

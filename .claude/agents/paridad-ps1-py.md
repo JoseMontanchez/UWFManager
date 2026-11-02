@@ -38,6 +38,7 @@ comentarios `# ----- / # =====`. Convención de nombres: `Verbo-Sustantivo` en P
 | Perfiles | `Get-PerfilPredeterminado`, `Leer-Perfil`, `Guardar-Perfil`, `Aplicar-Perfil` | `get_perfil_predeterminado`, `leer_perfil`, `guardar_perfil`, `aplicar_perfil` |
 | Persistencia | `Test-FiltroActivoAhora`, `Persistir-EnDisco` | `filtro_activo_ahora`, `persistir_en_disco` |
 | Instalación | `Instalar-Copia`, `Eliminar-TareaAntigua`, `Crear-AccesoDirecto` | `instalar_copia`, `eliminar_tarea_antigua`, `crear_acceso_directo` (+ `_pythonw`, `_script_origen`) |
+| Actualización | `$script:BuscarActualizacion` (scriptblock de runspace, con `Get-NumeroVersion` dentro), `Instalar-Actualizacion` | `buscar_actualizacion` (hilo), `_numero_version`, `instalar_actualizacion`. Asimetría legítima: `AssetRelease` difiere y el `.py` sin compilar no se actualiza |
 | Mantenimiento | `Iniciar-Mantenimiento`, `Finalizar-Mantenimiento`, `Reiniciar-Equipo` | `iniciar_mantenimiento`, `finalizar_mantenimiento`, `reiniciar_equipo` |
 | GUI | `Mostrar-DialogoPrograma`, `Mostrar-Interfaz` | `mostrar_dialogo_programa`, `mostrar_interfaz` |
 

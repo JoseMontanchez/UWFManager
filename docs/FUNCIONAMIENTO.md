@@ -124,7 +124,30 @@ protegido y la tarea reaparece al reiniciar. No pasa nada, porque la tarea lanza
 instalada, que ya es la version nueva, y esta la vuelve a borrar sin tocar el filtro. En el
 primer arranque sin proteccion (al iniciar un mantenimiento) el borrado queda definitivo.
 
-Por eso, **actualizar un equipo es solo ejecutar la version nueva una vez**.
+Por eso, **actualizar a mano un equipo es solo ejecutar la version nueva una vez**.
+
+### Actualizacion automatica
+
+Desde la v6, al abrir la interfaz se lanza una busqueda en segundo plano (un hilo en Python, un
+runspace en PowerShell) que no bloquea la ventana:
+
+1. Consulta en la API de GitHub la release *Latest* (excluye borradores y *pre-releases*).
+2. Si su etiqueta no es mayor que la version en ejecucion, o el SHA-256 publicado coincide con
+   la copia instalada, termina.
+3. Descarga el fichero (`UWFManager.exe` o `UWF-Aulas.ps1`) a `<copia>.nuevo-<aleatorio>` y
+   comprueba su SHA-256 con el que publica GitHub. Si no coincide, lo borra.
+4. Sustituye la copia instalada renombrando el fichero, lo que evita dejarla a medias. Si esta
+   en uso la aparta a `.old-<fecha>`. Con el filtro activo la lleva al disco real con
+   `uwfmgr file commit`.
+
+La version nueva se usa la **proxima vez que se abra**; la barra de estado lo indica. Un fallo
+(sin red, limite de la API, release incompleta) no interrumpe nada: queda en el log
+(`BuscarActualizacion;ERROR`) y se reintenta en la siguiente apertura.
+
+No hay tarea programada ni servicio, porque la herramienta no debe tener nada corriendo sin la
+ventana abierta ([seccion 2](#2-piezas)): un equipo se actualiza cuando alguien la abre, no
+cuando sale la release. Si se ejecuta una version mas antigua desde un USB, sustituye a la
+instalada y la busqueda vuelve a poner la ultima. El `.py` sin compilar no se actualiza.
 
 ### Primera puesta en marcha de un equipo
 
@@ -395,8 +418,8 @@ fecha;equipo;usuario;accion;resultado;detalle
 
 Acciones mas habituales: `InstalarCaracteristica`, `PrepararEquipo`, `EncolarExclusion`,
 `EncolarUsoDisco`, `AplicarPendientes`, `IniciarMantenimiento`, `FinalizarMantenimiento`,
-`Reinicio`, `ActualizarInstalacion`, `EliminarTareaAntigua`, `PersistirFichero` y
-`Autoinstalacion`.
+`Reinicio`, `ActualizarInstalacion`, `BuscarActualizacion`, `EliminarTareaAntigua`,
+`PersistirFichero` y `Autoinstalacion`.
 
 ## 13. Garantias de seguridad
 
@@ -430,6 +453,8 @@ Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
 | El banner esta en rojo sin que nadie haya iniciado un mantenimiento | Alguien desactivo el filtro fuera de la herramienta, o no se cerro un mantenimiento. Pulsar *3 - Finalizar, proteger y reiniciar*. |
 | La cola o la configuracion desaparecen tras reiniciar | `uwfmgr file commit` ha fallado. El motivo esta en el log de red (`PersistirFichero;ERROR`). |
 | Aviso "No se ha podido actualizar la copia instalada" | Otra ventana de la herramienta tenia la copia en uso. Cerrarlas todas y volver a abrir la version nueva. |
+| Un equipo no se actualiza solo | Hay que abrir la herramienta en el. El motivo de un fallo esta en el log (`BuscarActualizacion;ERROR`): sin salida a `api.github.com` y `github.com`, o release sin el fichero. Las versiones anteriores a la v6 no se actualizan solas: hay que ejecutar la v6 una vez. |
+| Defender detecta `UWFManager.exe` como `Program:Win32/Contebrew.A!ml` | Es una deteccion por aprendizaje automatico, no una firma de malware conocido. Si la descarga queda bloqueada, la copia instalada no cambia y el fallo queda en el log (`BuscarActualizacion;ERROR`). El procedimiento esta en "Publicar una version" del README. |
 | El estado no muestra el consumo del uso del disco | WMI no lo ha devuelto y tampoco se ha podido leer de `uwfmgr`. No afecta a la proteccion. |
 
 ## 15. Limitaciones conocidas
@@ -439,6 +464,10 @@ Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
   por defecto de `ProgramData`, que dejan crear ficheros a cualquier usuario. Un
   `pendientes.json` plantado se aplicaria al pulsar *Aplicar* o *Finalizar* (el tecnico lo
   ve antes en la lista). Endurecer esos permisos esta pendiente.
+- **Actualizacion sin firma**: el SHA-256 detecta una descarga corrupta, pero viene de la misma
+  cuenta de GitHub que el fichero. Quien controle esa cuenta puede ejecutar codigo como
+  administrador en todas las aulas, y una release defectuosa llega a todas igual. Firmar el
+  `.exe` y comprobar la firma cerraria ese riesgo.
 - **Respaldo por texto**: si WMI no responde, el consumo del overlay y la lista de
   exclusiones se leen de la salida de `uwfmgr`; en ese caso no se distingue entre la sesion
   actual y la siguiente.
