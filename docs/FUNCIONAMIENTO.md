@@ -36,8 +36,8 @@ UWF trae un *servicing mode* para eso, pero es fragil y no cubre el software de 
 UWFManager lo sustituye por un flujo mas simple y manual:
 
 - Para cambiar algo de forma permanente se **desactiva el filtro**, se reinicia, se trabaja
-  y el tecnico lo **vuelve a activar** con un boton. Nada lo reactiva por su cuenta: no hay
-  ningun proceso en segundo plano.
+  y el tecnico lo **vuelve a activar** con un boton. Nada lo reactiva por su cuenta: la unica
+  tarea en segundo plano es la actualizacion semanal, que no toca el filtro.
 - Los cambios de configuracion de UWF (exclusiones y uso del disco) **no se aplican al
   momento**: se encolan y se aplican de una vez con un solo boton.
 
@@ -73,15 +73,18 @@ UWFManager lo sustituye por un flujo mas simple y manual:
   hacerse en las dos.
 - **Interfaz**: la usa el tecnico. Se abre sin argumentos y exige ser administrador.
 - **Carpeta de trabajo** `C:\ProgramData\UWF-Aulas\`: configuracion, cola y log (ver
-  [seccion 11](#11-ficheros-que-guarda-en-el-equipo)). Esta carpeta no es una exclusion de
-  UWF: lo que la herramienta escribe ahi con el filtro activo se lleva al disco real con
-  `uwfmgr file commit` (o `commit-delete` si se borra). Sin eso, la cola y la configuracion
-  se perderian en el siguiente reinicio.
+  [seccion 11](#11-ficheros-que-guarda-en-el-equipo)). Desde la v6 es una exclusion de UWF:
+  se anade sola al abrir la herramienta y al preparar el equipo, y es lo unico que llega a UWF
+  sin pasar por la cola. Surte efecto tras el siguiente reinicio. Hasta entonces, lo que la
+  herramienta escribe ahi con el filtro activo se lleva al disco real con `uwfmgr file commit`
+  (o `commit-delete` si se borra). En la misma apertura se ajustan sus permisos para que solo
+  SYSTEM y los administradores puedan escribir en ella.
 - Las versiones anteriores tenian un *vigilante*: una tarea programada de arranque
   (`UWF-Aulas-Vigilante`) que reactivaba la proteccion sola. Se ha quitado porque, al no
   persistir sus ficheros de estado, reactivaba el filtro en cuanto arrancaba un
   mantenimiento. La version actual borra esa tarea si la encuentra (ver
-  [seccion 4](#4-instalacion-y-actualizacion-en-cada-equipo)).
+  [seccion 4](#4-instalacion-y-actualizacion-en-cada-equipo)). La tarea actual,
+  `UWF-Aulas-Actualizacion`, solo actualiza ficheros y nunca toca el filtro.
 
 ## 3. Como lee y como actua sobre UWF
 
@@ -128,26 +131,33 @@ Por eso, **actualizar a mano un equipo es solo ejecutar la version nueva una vez
 
 ### Actualizacion automatica
 
-Desde la v6, al abrir la interfaz se lanza una busqueda en segundo plano (un hilo en Python, un
-runspace en PowerShell) que no bloquea la ventana:
+Desde la v6, al activar la proteccion (*Preparar equipo* y *Finalizar*) se registra la tarea
+`UWF-Aulas-Actualizacion`: los lunes a las 12:00 como SYSTEM o, si el equipo estaba apagado, en
+cuanto pueda. Se registra en ese momento porque el filtro suele estar desactivado y queda
+guardada; con el filtro activo el registro se perderia al reiniciar. Ejecuta
+`UWF-Aulas.ps1 -Actualizar`, tambien en equipos instalados con el `.exe`:
 
-1. Consulta en la API de GitHub la release *Latest* (excluye borradores y *pre-releases*).
-2. Si su etiqueta no es mayor que la version en ejecucion, o el SHA-256 publicado coincide con
-   la copia instalada, termina.
-3. Descarga el fichero (`UWFManager.exe` o `UWF-Aulas.ps1`) a `<copia>.nuevo-<aleatorio>` y
-   comprueba su SHA-256 con el que publica GitHub. Si no coincide, lo borra.
-4. Sustituye la copia instalada renombrando el fichero, lo que evita dejarla a medias. Si esta
-   en uso la aparta a `.old-<fecha>`. Con el filtro activo la lleva al disco real con
-   `uwfmgr file commit`.
+1. Sale si no han pasado 7 dias desde la ultima comprobacion correcta (`ultimaComprobacion` en
+   `config.json`). Hace falta esta cuenta porque el filtro hace olvidar a la tarea su ultima
+   ejecucion.
+2. Consulta en la API de GitHub la release *Latest* (excluye borradores y *pre-releases*). Si su
+   etiqueta no es mayor que `$script:Version`, anota la fecha y termina.
+3. Descarga `archive/refs/tags/<etiqueta>.zip` a una carpeta temporal dentro de la de trabajo y
+   lo descomprime.
+4. Comprueba que `UWF-Aulas.ps1` existe, se puede parsear y sigue teniendo la funcion de
+   actualizacion.
+5. Sustituye en `C:\ProgramData\UWF-Aulas\` solo los ficheros `.bat`, `.ps1`, `.py`, `.spec` y
+   `.txt`, cada uno por renombrado y con `UWF-Aulas.ps1` el ultimo. Mientras la exclusion de la
+   carpeta no surta efecto, los lleva al disco real con `uwfmgr file commit`.
+6. Rehace el acceso directo para que apunte a `UWF-Aulas.bat`.
 
-La version nueva se usa la **proxima vez que se abra**; la barra de estado lo indica. Un fallo
-(sin red, limite de la API, release incompleta) no interrumpe nada: queda en el log
-(`BuscarActualizacion;ERROR`) y se reintenta en la siguiente apertura.
+La tarea no toca el filtro, la cola ni `config.json` salvo la fecha, y un fallo se reintenta en
+la siguiente ejecucion (`BuscarActualizacion;ERROR` en el log).
 
-No hay tarea programada ni servicio, porque la herramienta no debe tener nada corriendo sin la
-ventana abierta ([seccion 2](#2-piezas)): un equipo se actualiza cuando alguien la abre, no
-cuando sale la release. Si se ejecuta una version mas antigua desde un USB, sustituye a la
-instalada y la busqueda vuelve a poner la ultima. El `.py` sin compilar no se actualiza.
+**El `.exe` no se actualiza**: el `.zip` del repositorio no lo incluye. Tras la primera
+actualizacion, el equipo pasa a usar `UWF-Aulas.ps1`, que hace lo mismo; `UWF-Aulas.exe` se queda
+en la carpeta sin usar. Si despues se ejecuta un `.exe` desde un USB, el acceso directo vuelve a
+apuntar a el hasta la siguiente actualizacion.
 
 ### Primera puesta en marcha de un equipo
 
@@ -387,12 +397,13 @@ La **barra de cambios pendientes**, abajo, muestra lo que hay en la cola y los b
 
 ## 11. Ficheros que guarda en el equipo
 
-Todos en `C:\ProgramData\UWF-Aulas\`. Con el filtro activo, la herramienta los lleva al
-disco real con `uwfmgr file commit` al escribirlos (salvo el log):
+Todos en `C:\ProgramData\UWF-Aulas\`, que esta excluida de UWF desde el reinicio siguiente a
+la primera apertura de la v6. Hasta entonces, con el filtro activo, la herramienta los lleva
+al disco real con `uwfmgr file commit` al escribirlos (salvo el log):
 
 | Fichero | Contenido |
 |---|---|
-| `config.json` | `rutaLogRed` (carpeta de red del log centralizado, opcional). Las versiones anteriores guardaban tambien `horasMaxMantenimiento`; ahora se ignora. |
+| `config.json` | `rutaLogRed` (carpeta de red del log centralizado, opcional) y `ultimaComprobacion` (fecha de la ultima busqueda correcta de actualizaciones). Las versiones anteriores guardaban tambien `horasMaxMantenimiento`; ahora se ignora. |
 | `pendientes.json` | Cola de cambios: `exclusiones` (lista de `{tipo: archivo|registro, accion: add|remove, valor}`) y `disco` (`{tipo, tamanoMB, avisoMB, criticoMB}` o `null`), mas `version`, `actualizado`, `tecnico` y `equipo`. Se borra cuando la cola queda vacia. |
 | `perfil-exclusiones.json` | Perfil activo (ver [seccion 9](#9-perfiles)). |
 | `uwf-aulas.log` | Registro local (ver [seccion 12](#12-registro-log)). |
@@ -410,16 +421,17 @@ fecha;equipo;usuario;accion;resultado;detalle
 - `resultado` es uno de `OK`, `PARCIAL`, `ERROR`, `AVISO` o `INFO`.
 - El `detalle` nunca debe contener `;`: la herramienta los sustituye en los textos que
   vienen de programas externos (DISM, `uwfmgr`) para no descuadrar las columnas.
-- Las lineas escritas con el filtro activo se pierden al reiniciar: el log local no se
-  lleva al disco real en cada escritura. El log de red si las conserva.
+- Las lineas escritas con el filtro activo se pierden al reiniciar hasta que la exclusion de
+  la carpeta surte efecto: antes el log local no se lleva al disco real en cada escritura. El
+  log de red si las conserva.
 - Si en Configuracion hay una ruta de red, cada linea se anade tambien a
   `<ruta>\uwf-aulas-AAAA-MM.csv`, un fichero por mes con los registros de todos los equipos.
   Si la red no esta disponible, se ignora sin afectar al resto.
 
 Acciones mas habituales: `InstalarCaracteristica`, `PrepararEquipo`, `EncolarExclusion`,
 `EncolarUsoDisco`, `AplicarPendientes`, `IniciarMantenimiento`, `FinalizarMantenimiento`,
-`Reinicio`, `ActualizarInstalacion`, `BuscarActualizacion`, `EliminarTareaAntigua`,
-`PersistirFichero` y `Autoinstalacion`.
+`Reinicio`, `ActualizarInstalacion`, `BuscarActualizacion`, `RegistrarTareaActualizacion`,
+`PermisosCarpeta`, `EliminarTareaAntigua`, `PersistirFichero` y `Autoinstalacion`.
 
 ## 13. Garantias de seguridad
 
@@ -453,21 +465,20 @@ Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
 | El banner esta en rojo sin que nadie haya iniciado un mantenimiento | Alguien desactivo el filtro fuera de la herramienta, o no se cerro un mantenimiento. Pulsar *3 - Finalizar, proteger y reiniciar*. |
 | La cola o la configuracion desaparecen tras reiniciar | `uwfmgr file commit` ha fallado. El motivo esta en el log de red (`PersistirFichero;ERROR`). |
 | Aviso "No se ha podido actualizar la copia instalada" | Otra ventana de la herramienta tenia la copia en uso. Cerrarlas todas y volver a abrir la version nueva. |
-| Un equipo no se actualiza solo | Hay que abrir la herramienta en el. El motivo de un fallo esta en el log (`BuscarActualizacion;ERROR`): sin salida a `api.github.com` y `github.com`, o release sin el fichero. Las versiones anteriores a la v6 no se actualizan solas: hay que ejecutar la v6 una vez. |
+| Un equipo no se actualiza solo | La tarea se registra al pulsar *Preparar equipo* o *Finalizar* con la v6: comprobar que existe con `schtasks /query /tn UWF-Aulas-Actualizacion` y mirar `RegistrarTareaActualizacion` en el log. El motivo de un fallo al actualizar esta en `BuscarActualizacion;ERROR`: sin salida a `api.github.com` y `github.com`, o un `.ps1` que no pasa la comprobacion. Las versiones anteriores a la v6 no se actualizan solas. |
 | Defender detecta `UWFManager.exe` como `Program:Win32/Contebrew.A!ml` | Es una deteccion por aprendizaje automatico, no una firma de malware conocido. Si la descarga queda bloqueada, la copia instalada no cambia y el fallo queda en el log (`BuscarActualizacion;ERROR`). El procedimiento esta en "Publicar una version" del README. |
 | El estado no muestra el consumo del uso del disco | WMI no lo ha devuelto y tampoco se ha podido leer de `uwfmgr`. No afecta a la proteccion. |
 
 ## 15. Limitaciones conocidas
 
 - **Solo `C:`**: la herramienta protege y lista exclusiones solo del volumen `C:`.
-- **Permisos de la carpeta de trabajo**: `C:\ProgramData\UWF-Aulas\` hereda los permisos
-  por defecto de `ProgramData`, que dejan crear ficheros a cualquier usuario. Un
-  `pendientes.json` plantado se aplicaria al pulsar *Aplicar* o *Finalizar* (el tecnico lo
-  ve antes en la lista). Endurecer esos permisos esta pendiente.
-- **Actualizacion sin firma**: el SHA-256 detecta una descarga corrupta, pero viene de la misma
-  cuenta de GitHub que el fichero. Quien controle esa cuenta puede ejecutar codigo como
-  administrador en todas las aulas, y una release defectuosa llega a todas igual. Firmar el
-  `.exe` y comprobar la firma cerraria ese riesgo.
+- **Permisos de la carpeta de trabajo**: se ajustan al abrir la herramienta para que solo
+  SYSTEM y los administradores escriban en `C:\ProgramData\UWF-Aulas\`. Lo que un usuario
+  hubiera creado antes conserva sus propios permisos.
+- **Actualizacion sin firma ni hash**: GitHub no publica el SHA-256 de los `.zip` del
+  repositorio, asi que solo se comprueba que el `.ps1` se pueda parsear. Quien controle la
+  cuenta del repositorio puede ejecutar codigo como SYSTEM en todas las aulas, y una release
+  defectuosa llega a todas igual.
 - **Respaldo por texto**: si WMI no responde, el consumo del overlay y la lista de
   exclusiones se leen de la salida de `uwfmgr`; en ese caso no se distingue entre la sesion
   actual y la siguiente.

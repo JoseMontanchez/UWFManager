@@ -53,12 +53,15 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
   3. Finalizar y proteger -> aplica los cambios pendientes, reactiva el filtro y reinicia.
 
   La proteccion **no vuelve sola**: hasta pulsar *Finalizar*, el equipo sigue sin proteger y
-  la interfaz lo avisa en rojo. No hay ningun proceso en segundo plano.
-- **Actualizacion automatica**: cada vez que se abre la herramienta, mira en segundo plano la
+  la interfaz lo avisa en rojo. Nada en segundo plano toca el filtro.
+- **Actualizacion automatica**: al activar la proteccion se registra la tarea semanal
+  `UWF-Aulas-Actualizacion`. Mira la
   [ultima release](https://github.com/JoseMontanchez/UWFManager/releases) y, si es mas nueva,
-  la descarga, comprueba su SHA-256 y sustituye la copia instalada sin molestar al tecnico. La
-  version nueva se usa la proxima vez que se abra. Solo funciona con la ventana abierta: no hay
-  tarea programada ni servicio.
+  descarga el `.zip` del repositorio en esa etiqueta, lo descomprime y sustituye los ficheros
+  `.bat`, `.ps1`, `.py`, `.spec` y `.txt`. La tarea nunca toca el filtro.
+- **Carpeta excluida**: `C:\ProgramData\UWF-Aulas\` se anade sola a las exclusiones de UWF al
+  abrir la herramienta y al preparar el equipo, sin pasar por la cola. Surte efecto tras el
+  siguiente reinicio y solo los administradores pueden escribir en ella.
 - **Registro**: cada accion queda en un log CSV local (`C:\ProgramData\UWF-Aulas\uwf-aulas.log`)
   y, si se configura una ruta de red, tambien en un log centralizado por mes.
 
@@ -95,6 +98,7 @@ cambios sin aplicar) y `uwf-aulas.log`.
   deja sobrescribir un ejecutable en uso, si esta abierto aparta el anterior a un
   `.old-<fecha>` que borra en la siguiente ejecucion. Si aun asi no pudiera sustituirlo,
   **avisa al tecnico**.
+- `-Actualizar` (solo en el `.ps1`) es lo que ejecuta la tarea semanal: no abre la GUI.
 - `-Vigilante` / `--vigilante` ya no hace nada salvo borrar la tarea antigua: solo existe
   para que la tarea de una version anterior, si reaparece, se elimine sin tocar el filtro.
 
@@ -129,12 +133,11 @@ publique llega a todas las aulas. Para sacar la version `N`:
    `version_info.txt`.
 2. Compila el `.exe` y ejecuta `.\Comprobar-Release.ps1` en un equipo con Defender activo.
 3. Crea en GitHub la release con la etiqueta `vN` (`v7` o `v7.1`), marcada como *pre-release*,
-   y adjunta **`UWFManager.exe`** y **`UWF-Aulas.ps1`** con esos nombres exactos. Si falta uno,
-   los equipos que usen esa version siguen como estan y lo anotan en el log
-   (`BuscarActualizacion;ERROR`).
+   y adjunta **`UWFManager.exe`** para quien lo reparta por USB. La etiqueta debe apuntar a un
+   commit cuyo `UWF-Aulas.ps1` tenga ese mismo numero en `$script:Version`.
 4. Envia el `.exe` a Microsoft (ver abajo) y pruebalo en un equipo a mano.
-5. Cuando este limpio, marca la release como *Latest*: en ese momento empieza a llegar a las
-   aulas. Una *pre-release* queda fuera de la actualizacion automatica.
+5. Cuando este limpio, marca la release como *Latest*: desde ese momento la tarea semanal la
+   instala en las aulas. Una *pre-release* queda fuera.
 
 ### Falso positivo de Defender (`Program:Win32/Contebrew.A!ml`)
 

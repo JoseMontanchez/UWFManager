@@ -35,13 +35,16 @@ aulas a la vez.
    idioma del sistema. Único parseo tolerado: el fallback de consumo documentado en
    `Get-EstadoUwf`.
 5. **El filtro solo lo activa y desactiva el técnico.** No hay vigilante ni tarea de
-   arranque (se quitó a propósito: no debe volver). `filter disable` solo sale del botón
+   arranque (se quitó a propósito: no debe volver). La única tarea es la semanal
+   `UWF-Aulas-Actualizacion`, y solo sustituye ficheros: `-Actualizar` no debe tocar nunca el
+   filtro, la cola ni `uwfmgr` salvo `file commit`. `filter disable` solo sale del botón
    *Iniciar mantenimiento*; `filter enable`, de *Finalizar* y *Preparar equipo*.
    *Finalizar* reactiva el filtro aunque falle la cola de pendientes. Mientras el filtro
    está desactivado la GUI lo avisa en rojo.
-6. **Persistencia con el filtro activo.** `C:\ProgramData\UWF-Aulas\` no es una exclusión:
-   todo fichero que la herramienta necesite tras reiniciar (cola, configuración, copia
-   instalada, acceso directo) se pasa por `persistir_en_disco` / `Persistir-EnDisco`
+6. **Persistencia con el filtro activo.** `C:\ProgramData\UWF-Aulas\` se excluye sola
+   (`asegurar_exclusion_carpeta` / `Asegurar-ExclusionCarpeta`), pero solo tras reiniciar.
+   Hasta entonces, y para lo que queda fuera como el acceso directo, todo fichero que la
+   herramienta necesite tras reiniciar se pasa por `persistir_en_disco` / `Persistir-EnDisco`
    (`uwfmgr file commit` / `commit-delete`) al escribirlo o borrarlo. Un fichero nuevo que
    se escriba sin eso se pierde en el siguiente reinicio.
 7. **Privilegios y elevación.** Las acciones sobre UWF exigen admin; comprueba que se
@@ -60,8 +63,9 @@ aulas a la vez.
 - Rutas de registro que no se normalizan a `HKLM\...` antes de usarse.
 - Términos de búsqueda de la heurística de menos de 4 caracteres (produce coincidencias
   basura y exclusiones peligrosas).
-- Escrituras en `C:\ProgramData\UWF-Aulas\` sin tener en cuenta que la tarea SYSTEM lee
-  de ahí (ACL laxa: es una ruta de escalada conocida y pendiente de endurecer).
+- Cambios que dejen escribir a usuarios sin privilegios en `C:\ProgramData\UWF-Aulas\`: al
+  estar excluida, lo que se plante ahí sobrevive a los reinicios y lo lee una herramienta
+  elevada (`endurecer_permisos_carpeta` / `Endurecer-PermisosCarpeta`).
 - Cualquier cosa que asuma que `uwfmgr.exe` existe: en Windows Pro/Home no está.
 
 ## Qué entregas

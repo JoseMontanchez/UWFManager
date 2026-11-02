@@ -5,7 +5,7 @@ a = Analysis(
     ['UWF-Aulas.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[('UWF-Aulas.ps1', '.')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

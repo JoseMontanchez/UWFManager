@@ -38,7 +38,8 @@ comentarios `# ----- / # =====`. Convención de nombres: `Verbo-Sustantivo` en P
 | Perfiles | `Get-PerfilPredeterminado`, `Leer-Perfil`, `Guardar-Perfil`, `Aplicar-Perfil` | `get_perfil_predeterminado`, `leer_perfil`, `guardar_perfil`, `aplicar_perfil` |
 | Persistencia | `Test-FiltroActivoAhora`, `Persistir-EnDisco` | `filtro_activo_ahora`, `persistir_en_disco` |
 | Instalación | `Instalar-Copia`, `Eliminar-TareaAntigua`, `Crear-AccesoDirecto` | `instalar_copia`, `eliminar_tarea_antigua`, `crear_acceso_directo` (+ `_pythonw`, `_script_origen`) |
-| Actualización | `$script:BuscarActualizacion` (scriptblock de runspace, con `Get-NumeroVersion` dentro), `Instalar-Actualizacion` | `buscar_actualizacion` (hilo), `_numero_version`, `instalar_actualizacion`. Asimetría legítima: `AssetRelease` difiere y el `.py` sin compilar no se actualiza |
+| Actualización | `Get-XmlTareaActualizacion`, `Registrar-TareaActualizacion` | `_xml_tarea_actualizacion`, `registrar_tarea_actualizacion` (+ `_ps1_origen`). Asimetría legítima: `-Actualizar` y `Actualizar-DesdeRepositorio` solo existen en el `.ps1`, porque la tarea siempre ejecuta el `.ps1`. El XML de la tarea debe ser idéntico en las dos |
+| Carpeta de trabajo | `Get-ExclusionCarpeta`, `Test-CarpetaExcluidaAhora`, `Asegurar-ExclusionCarpeta`, `Endurecer-PermisosCarpeta` | `_exclusion_carpeta`, `carpeta_excluida_ahora`, `asegurar_exclusion_carpeta`, `endurecer_permisos_carpeta` |
 | Mantenimiento | `Iniciar-Mantenimiento`, `Finalizar-Mantenimiento`, `Reiniciar-Equipo` | `iniciar_mantenimiento`, `finalizar_mantenimiento`, `reiniciar_equipo` |
 | GUI | `Mostrar-DialogoPrograma`, `Mostrar-Interfaz` | `mostrar_dialogo_programa`, `mostrar_interfaz` |
 

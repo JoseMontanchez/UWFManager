@@ -1,10 +1,11 @@
 ﻿param(
-    [switch]$Vigilante
+    [switch]$Vigilante,
+    [switch]$Actualizar
 )
 
 # =============================================================================
 #  UWF Aulas v2 - gestion del Unified Write Filter para las aulas de la UV
-#  Interfaz grafica para el tecnico. No hay ningun proceso en segundo plano: la
+#  Interfaz grafica para el tecnico. Nada en segundo plano toca el filtro: la
 #  proteccion solo se desactiva y se reactiva cuando el tecnico lo pide.
 #  (-Vigilante solo existe para borrar la tarea de arranque de versiones anteriores.)
 #
@@ -24,10 +25,12 @@
 #     claves de los perfiles JSON) se conserva el termino de UWF.
 #
 #  Cambios v6:
-#   - Actualizacion automatica: al abrir la GUI, un runspace mira la ultima release de
-#     GitHub y, si es mas nueva, la descarga, comprueba su SHA-256 y sustituye la copia
-#     instalada. Se usa la proxima vez que se abra. No hay tarea programada: sin la GUI
-#     abierta no corre nada.
+#   - Actualizacion automatica: al activar la proteccion se registra la tarea semanal
+#     TareaActualizacion, que ejecuta este script con -Actualizar como SYSTEM. Descarga el
+#     .zip del repositorio y sustituye los ficheros de ExtensionesActualizables. La tarea
+#     nunca toca el filtro.
+#   - La carpeta de trabajo se excluye sola de UWF (Asegurar-ExclusionCarpeta) para que lo
+#     actualizado sobreviva a los reinicios, y solo los administradores pueden escribir en ella.
 # =============================================================================
 
 $ErrorActionPreference = 'Stop'
@@ -42,8 +45,11 @@ $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
 $script:TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
 $script:Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+$script:TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver Registrar-TareaActualizacion
 $script:UrlRelease = 'https://api.github.com/repos/JoseMontanchez/UWFManager/releases/latest'
-$script:AssetRelease = 'UWF-Aulas.ps1'         # fichero de la release que sustituye a la copia instalada
+$script:UrlZip     = 'https://github.com/JoseMontanchez/UWFManager/archive/refs/tags/{0}.zip'
+$script:ExtensionesActualizables = @('.bat', '.ps1', '.py', '.spec', '.txt')
+$script:DiasEntreComprobaciones = 7            # dias minimos entre dos consultas a GitHub
 $script:Caracteristica = 'Client-UnifiedWriteFilter'
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
@@ -195,8 +201,11 @@ function Persistir-EnDisco([string]$Ruta, [switch]$Borrado) {
     # Lleva al disco real un fichero de la herramienta escrito (o borrado) con la proteccion
     # activa. Sin esto se quedaba en el overlay y desaparecia al reiniciar: por ejemplo, la
     # cola de pendientes no sobrevivia al reinicio que abre el mantenimiento. Con el filtro
-    # desactivado no hace falta, porque ya se escribe directamente en el disco.
+    # desactivado no hace falta, porque ya se escribe directamente en el disco. Tampoco si la
+    # carpeta de trabajo ya esta excluida en esta sesion.
     if (-not (Test-FiltroActivoAhora)) { return }
+    if ($Ruta.StartsWith($script:Base + '\', [StringComparison]::OrdinalIgnoreCase) -and
+        (Test-CarpetaExcluidaAhora)) { return }
     $orden = if ($Borrado) { 'commit-delete' } else { 'commit' }
     $r = Invoke-Uwf @('file', $orden, $Ruta)
     if (-not $r.Ok) {
@@ -468,6 +477,32 @@ function Add-ExclusionArchivo([string]$ruta) {
     $r = Invoke-Uwf @('file','add-exclusion',$ruta)
     Escribir-Log 'AddExclusionArchivo' $(if ($r.Ok) {'OK'} else {'ERROR'}) $ruta
     if (-not $r.Ok) { throw $r.Salida }
+}
+
+function Get-ExclusionCarpeta {
+    # Datos de la exclusion de la carpeta de trabajo en Get-ExclusionesDetalle, o nada.
+    foreach ($d in @(Get-ExclusionesDetalle)) {
+        if (($d.Tipo -eq 'archivo') -and ($d.Valor.TrimEnd('\') -eq $script:Base)) { return $d }
+    }
+}
+
+function Test-CarpetaExcluidaAhora {
+    # True si lo que se escribe en la carpeta de trabajo ya va directo al disco.
+    $d = Get-ExclusionCarpeta
+    return [bool]($d -and $d.Ahora)
+}
+
+function Asegurar-ExclusionCarpeta {
+    # Excluye de UWF la carpeta de trabajo si aun no lo esta, para que la copia instalada, la
+    # configuracion y la cola sobrevivan a los reinicios sin depender de 'uwfmgr file commit'.
+    #
+    # Es lo unico que llega a UWF sin pasar por la cola, y no toca el filtro ni la proteccion
+    # del resto del disco. Surte efecto tras el siguiente reinicio: hasta entonces sigue
+    # haciendo falta Persistir-EnDisco. Si alguien la quita, vuelve a anadirse al abrir la
+    # herramienta.
+    if (-not (Test-UwfInstalado)) { return }
+    $d = Get-ExclusionCarpeta
+    if (-not ($d -and $d.TrasReinicio)) { Add-ExclusionArchivo $script:Base }
 }
 
 function Remove-ExclusionArchivo([string]$ruta) {
@@ -994,82 +1029,192 @@ function Instalar-Copia {
     if ($restos.Count) { Escribir-Log 'LimpiarRestos' 'OK' ($restos -join ', ') }
 }
 
-# Mira la ultima release de GitHub y, si es mas nueva, la descarga junto a la copia instalada.
-# Corre en otro runspace: no ve las funciones de este script y no toca la GUI, ni UWF, ni el log.
-#
-# Devuelve @{Etiqueta; Fichero}, o nada si no hay nada que actualizar. La descarga no se da por
-# buena hasta que coincide con el SHA-256 que publica GitHub. Comparar tambien la huella evita
-# descargarla en cada arranque si una release se compila sin subir la version.
-$script:BuscarActualizacion = {
-    param([string]$Version, [string]$UrlRelease, [string]$AssetRelease, [string]$ScriptDest)
-    $ErrorActionPreference = 'Stop'
-
-    function Get-NumeroVersion([string]$Texto) {
-        # Convierte 'v6' o '6.1' en una version comparable de cuatro numeros (6.1.0.0)
-        if ($Texto.Trim() -notmatch '^[vV]?(\d+(\.\d+){0,3})$') {
-            throw "Etiqueta de version no reconocida: $Texto"
-        }
-        $numeros = @($Matches[1].Split('.'))
-        while ($numeros.Count -lt 4) { $numeros += '0' }
-        return [version]($numeros -join '.')
-    }
-
-    # PowerShell 5.1 no activa TLS 1.2 por defecto y GitHub no acepta nada inferior
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-
-    $release  = Invoke-RestMethod -Uri $UrlRelease -TimeoutSec 20 -UseBasicParsing `
-                    -UserAgent 'UWFManager' -Headers @{ Accept = 'application/vnd.github+json' }
-    $etiqueta = [string]$release.tag_name
-    if ((Get-NumeroVersion $etiqueta) -le (Get-NumeroVersion $Version)) { return }
-
-    $asset = @($release.assets | Where-Object { $_.name -ceq $AssetRelease }) | Select-Object -First 1
-    if (-not $asset) { throw "la release $etiqueta no trae $AssetRelease" }
-    $digest = ([string]$asset.digest).ToLower()
-    if (-not $digest.StartsWith('sha256:')) { throw "la release $etiqueta no publica el SHA-256 de $AssetRelease" }
-    $huella = $digest.Substring('sha256:'.Length)
-    if ((Test-Path -LiteralPath $ScriptDest) -and
-        ((Get-FileHash -LiteralPath $ScriptDest -Algorithm SHA256).Hash -eq $huella)) { return }
-
-    $nuevo = "$ScriptDest.nuevo-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
-    $web = New-Object System.Net.WebClient
+function Endurecer-PermisosCarpeta {
+    # Deja que solo SYSTEM y los administradores escriban en la carpeta de trabajo. Al estar
+    # excluida de UWF, lo que un alumno dejara ahi con los permisos heredados de ProgramData
+    # sobreviviria a los reinicios. Usa SID porque los nombres de grupo cambian con el idioma.
     try {
-        $web.Headers.Add('User-Agent', 'UWFManager')
-        $web.DownloadFile([string]$asset.browser_download_url, $nuevo)
-        if ((Get-FileHash -LiteralPath $nuevo -Algorithm SHA256).Hash -ne $huella) {
-            throw "el SHA-256 de la descarga de $etiqueta no coincide"
-        }
+        & icacls.exe $script:Base /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' `
+            '*S-1-5-32-544:(OI)(CI)F' '*S-1-5-32-545:(OI)(CI)RX' | Out-Null
+        if ($LASTEXITCODE -ne 0) { Escribir-Log 'PermisosCarpeta' 'ERROR' "icacls devolvio $LASTEXITCODE" }
     } catch {
-        Remove-Item -LiteralPath $nuevo -Force -ErrorAction SilentlyContinue
-        throw
-    } finally { $web.Dispose() }
-    return @{ Etiqueta = $etiqueta; Fichero = $nuevo }
+        Escribir-Log 'PermisosCarpeta' 'ERROR' ((($_.Exception.Message -replace ';', ',') -split '\s+') -join ' ')
+    }
 }
 
-function Instalar-Actualizacion($nueva) {
-    # Pone en su sitio lo descargado por BuscarActualizacion. Renombra en vez de copiar para que
-    # un corte a medias no deje la copia rota. Si no se puede sustituir se aparta a un
-    # '.old-<fecha>', igual que en Reemplazar-Instalado.
-    $fichero = $nueva.Fichero
+function Test-ComprobacionPendiente {
+    # True si toca mirar GitHub: nunca se ha mirado, han pasado DiasEntreComprobaciones o la
+    # fecha guardada no es valida o esta en el futuro.
+    $ultima = [datetime]::MinValue
+    $valida = [datetime]::TryParseExact([string](Leer-Config).ultimaComprobacion, 'yyyy-MM-dd',
+        [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$ultima)
+    if (-not $valida) { return $true }
+    $dias = ((Get-Date) - $ultima).Days
+    return (($dias -lt 0) -or ($dias -ge $script:DiasEntreComprobaciones))
+}
+
+function Anotar-Comprobacion {
+    # Guarda la fecha de hoy. Solo se llama si la comprobacion ha terminado bien: tras un fallo
+    # se reintenta en la siguiente apertura.
+    $cfg = Leer-Config
+    $cfg | Add-Member -NotePropertyName ultimaComprobacion -NotePropertyValue (Get-Date -Format 'yyyy-MM-dd') -Force
+    Guardar-Config $cfg
+}
+
+function Get-NumeroVersion([string]$Texto) {
+    # Convierte 'v6' o '6.1' en una version comparable de cuatro numeros (6.1.0.0)
+    if ($Texto.Trim() -notmatch '^[vV]?(\d+(\.\d+){0,3})$') {
+        throw "Etiqueta de version no reconocida: $Texto"
+    }
+    $numeros = @($Matches[1].Split('.'))
+    while ($numeros.Count -lt 4) { $numeros += '0' }
+    return [version]($numeros -join '.')
+}
+
+function Sustituir-Fichero([string]$Nuevo, [string]$Destino) {
+    # Pone $Nuevo en lugar de $Destino. Renombra en vez de copiar para que un corte a medias no
+    # deje el fichero roto. Si no se puede sustituir se aparta a un '.old-<fecha>', igual que en
+    # Reemplazar-Instalado.
     try {
         try {
-            Move-Item -LiteralPath $fichero -Destination $script:ScriptDest -Force -ErrorAction Stop
+            Move-Item -LiteralPath $Nuevo -Destination $Destino -Force -ErrorAction Stop
         } catch {
-            $apartado = "$($script:ScriptDest).old-$(Get-Date -Format 'yyyyMMddHHmmss')"
-            Move-Item -LiteralPath $script:ScriptDest -Destination $apartado -Force -ErrorAction Stop
+            $apartado = "$Destino.old-$(Get-Date -Format 'yyyyMMddHHmmss')"
+            Move-Item -LiteralPath $Destino -Destination $apartado -Force -ErrorAction Stop
             try {
-                Move-Item -LiteralPath $fichero -Destination $script:ScriptDest -Force -ErrorAction Stop
+                Move-Item -LiteralPath $Nuevo -Destination $Destino -Force -ErrorAction Stop
             } catch {
-                Move-Item -LiteralPath $apartado -Destination $script:ScriptDest -Force -ErrorAction Stop
+                Move-Item -LiteralPath $apartado -Destination $Destino -Force -ErrorAction Stop
                 throw
             }
         }
     } catch {
-        Remove-Item -LiteralPath $fichero -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $Nuevo -Force -ErrorAction SilentlyContinue
         throw
     }
     # Con la proteccion activa la copia nueva se perderia al reiniciar
-    Persistir-EnDisco $script:ScriptDest
-    Escribir-Log 'ActualizarInstalacion' 'OK' "actualizacion automatica a $($nueva.Etiqueta)"
+    Persistir-EnDisco $Destino
+}
+
+function Actualizar-DesdeRepositorio {
+    # Lo que ejecuta la tarea semanal. Descarga el .zip del repositorio en la etiqueta de la
+    # ultima release, lo descomprime y sustituye en la carpeta de trabajo los ficheros de
+    # ExtensionesActualizables. No toca el filtro ni la cola, y deja config.json intacto salvo
+    # la fecha.
+    #
+    # Usa la etiqueta y no la rama main para que solo llegue a las aulas lo publicado como
+    # Latest. GitHub no publica el SHA-256 de estos .zip: la unica comprobacion del contenido es
+    # que el .ps1 nuevo se pueda parsear y siga teniendo esta funcion.
+    if (-not (Test-ComprobacionPendiente)) { return }
+
+    # PowerShell 5.1 no activa TLS 1.2 por defecto y GitHub no acepta nada inferior
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $release  = Invoke-RestMethod -Uri $script:UrlRelease -TimeoutSec 20 -UseBasicParsing `
+                    -UserAgent 'UWFManager' -Headers @{ Accept = 'application/vnd.github+json' }
+    $etiqueta = [string]$release.tag_name
+    if ((Get-NumeroVersion $etiqueta) -le (Get-NumeroVersion $script:Version)) {
+        Anotar-Comprobacion
+        return
+    }
+
+    # Lo que haya dejado una ejecucion cortada a medias
+    Get-ChildItem -LiteralPath $script:Base -Directory -Filter 'descarga-*' -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    $temp = Join-Path $script:Base "descarga-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    $web = New-Object System.Net.WebClient
+    try {
+        $zip = Join-Path $temp 'repositorio.zip'
+        $web.Headers.Add('User-Agent', 'UWFManager')
+        $web.DownloadFile(($script:UrlZip -f $etiqueta), $zip)
+        $extraido = Join-Path $temp 'extraido'
+        Expand-Archive -LiteralPath $zip -DestinationPath $extraido
+
+        # GitHub mete todo en una unica carpeta raiz, UWFManager-<etiqueta>
+        $raices = @(Get-ChildItem -LiteralPath $extraido -Directory)
+        if ($raices.Count -ne 1) { throw "el .zip de $etiqueta no tiene una unica carpeta raiz" }
+        $raiz = $raices[0].FullName
+
+        $ps1 = Join-Path $raiz 'UWF-Aulas.ps1'
+        if (-not (Test-Path -LiteralPath $ps1)) { throw "el .zip de $etiqueta no trae UWF-Aulas.ps1" }
+        $texto = [IO.File]::ReadAllText($ps1)
+        $errores = $null
+        [void][System.Management.Automation.Language.Parser]::ParseInput($texto, [ref]$null, [ref]$errores)
+        if (@($errores).Count) { throw "el UWF-Aulas.ps1 de $etiqueta tiene errores de sintaxis" }
+        if ($texto -notmatch 'function Actualizar-DesdeRepositorio') {
+            throw "el UWF-Aulas.ps1 de $etiqueta ya no sabe actualizarse"
+        }
+
+        # El .ps1 principal va el ultimo: si falla algo antes, la tarea sigue siendo la que hay
+        $ficheros = @(Get-ChildItem -LiteralPath $raiz -Recurse -File |
+            Where-Object { $script:ExtensionesActualizables -contains $_.Extension } |
+            Sort-Object { $_.FullName -eq $ps1 })
+        foreach ($f in $ficheros) {
+            $destino = Join-Path $script:Base $f.FullName.Substring($raiz.Length + 1)
+            New-Item -ItemType Directory -Force -Path (Split-Path $destino) | Out-Null
+            $nuevo = "$destino.nuevo-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+            Copy-Item -LiteralPath $f.FullName -Destination $nuevo -Force
+            Sustituir-Fichero $nuevo $destino
+        }
+        Escribir-Log 'ActualizarInstalacion' 'OK' "actualizacion semanal a $etiqueta`: $($ficheros.Count) ficheros"
+        Anotar-Comprobacion
+        # El .exe no viene en el .zip: el acceso directo pasa a abrir lo que se acaba de actualizar
+        Crear-AccesoDirecto
+    } finally {
+        $web.Dispose()
+        Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-XmlTareaActualizacion {
+    # Definicion de la tarea, identica a la de _xml_tarea_actualizacion. Semanal porque el
+    # registro de tareas esta filtrado y con el filtro activo olvida su ultima ejecucion: con
+    # StartWhenAvailable puede arrancar de mas tras reiniciar, y por eso
+    # Actualizar-DesdeRepositorio lleva su propia cuenta de dias en config.json.
+    $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $argumentos = '-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass ' +
+                  "-File `"$($script:ScriptDest)`" -Actualizar"
+    return ('<?xml version="1.0" encoding="UTF-16"?>' + "`n" +
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + "`n" +
+        '  <RegistrationInfo><Description>Actualiza UWF Aulas una vez a la semana. No toca el filtro.</Description></RegistrationInfo>' + "`n" +
+        '  <Triggers><CalendarTrigger>' + "`n" +
+        '    <StartBoundary>2026-01-05T12:00:00</StartBoundary>' + "`n" +
+        '    <ScheduleByWeek><DaysOfWeek><Monday /></DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>' + "`n" +
+        '  </CalendarTrigger></Triggers>' + "`n" +
+        '  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>' + "`n" +
+        '  <Settings>' + "`n" +
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + "`n" +
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + "`n" +
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + "`n" +
+        '    <StartWhenAvailable>true</StartWhenAvailable>' + "`n" +
+        '    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>' + "`n" +
+        '    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>' + "`n" +
+        '  </Settings>' + "`n" +
+        ('  <Actions Context="Author"><Exec><Command>{0}</Command><Arguments>{1}</Arguments></Exec></Actions>' -f
+            [Security.SecurityElement]::Escape($powershell).Replace('&apos;', "'"),
+            [Security.SecurityElement]::Escape($argumentos).Replace('&apos;', "'")) + "`n" +
+        '</Task>' + "`n")
+}
+
+function Registrar-TareaActualizacion {
+    # Registra la tarea semanal de actualizacion. Se llama al activar la proteccion: en ese
+    # momento el filtro suele estar desactivado y el registro de tareas se guarda de verdad. No
+    # lanza excepcion: un fallo aqui nunca debe impedir proteger el equipo. La tarea solo
+    # actualiza ficheros; el filtro lo sigue activando y desactivando el tecnico.
+    $xml = "$($script:ScriptDest).nuevo-tarea"
+    try {
+        Endurecer-PermisosCarpeta
+        [IO.File]::WriteAllText($xml, (Get-XmlTareaActualizacion), [Text.Encoding]::Unicode)
+        $salida = & schtasks.exe /create /tn $script:TareaActualizacion /xml $xml /f
+        Escribir-Log 'RegistrarTareaActualizacion' $(if ($LASTEXITCODE -eq 0) {'OK'} else {'ERROR'}) `
+            ((($salida -join ' ') -replace ';', ',') -replace '\s+', ' ')
+    } catch {
+        Escribir-Log 'RegistrarTareaActualizacion' 'ERROR' ((($_.Exception.Message -replace ';', ',') -split '\s+') -join ' ')
+    } finally {
+        Remove-Item -LiteralPath $xml -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Crear-AccesoDirecto {
@@ -1077,8 +1222,15 @@ function Crear-AccesoDirecto {
         $destino = Join-Path (Join-Path $env:PUBLIC 'Desktop') 'UWF Aulas.lnk'
         $ws  = New-Object -ComObject WScript.Shell
         $lnk = $ws.CreateShortcut($destino)
-        $lnk.TargetPath       = 'powershell.exe'
-        $lnk.Arguments        = ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $script:ScriptDest)
+        # El .bat pide elevacion por si mismo; lo instala la actualizacion semanal
+        $bat = Join-Path $script:Base 'UWF-Aulas.bat'
+        if (Test-Path -LiteralPath $bat) {
+            $lnk.TargetPath   = $bat
+            $lnk.Arguments    = ''
+        } else {
+            $lnk.TargetPath   = 'powershell.exe'
+            $lnk.Arguments    = ('-NoProfile -ExecutionPolicy Bypass -STA -File "{0}"' -f $script:ScriptDest)
+        }
         $lnk.WorkingDirectory = $script:Base
         $lnk.IconLocation     = "$env:SystemRoot\System32\shell32.dll,48"
         $lnk.Description      = 'Gestion del Unified Write Filter'
@@ -1109,6 +1261,7 @@ function Finalizar-Mantenimiento {
     $r = Invoke-Uwf @('filter','enable')
     if (-not $r.Ok) { throw "No se ha podido activar el filtro: $($r.Salida)" }
     Escribir-Log 'FinalizarMantenimiento' 'OK' 'filtro activado, pendiente de reinicio'
+    Registrar-TareaActualizacion
     return $res
 }
 
@@ -1906,8 +2059,10 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
             if (-not $r.Ok) { throw "No se ha podido proteger C: con UWF:`n`n$($r.Salida)" }
             $u = Get-EstadoUwf
             $errores = @(Aplicar-Perfil (Leer-Perfil) $u.FiltroActual)
+            try { Asegurar-ExclusionCarpeta } catch { $errores += "$($script:Base) -> $($_.Exception.Message)" }
             $r = Invoke-Uwf @('filter','enable')
             if (-not $r.Ok) { throw "No se ha podido activar el filtro:`n`n$($r.Salida)" }
+            Registrar-TareaActualizacion
             Escribir-Log 'PrepararEquipo' $(if ($errores.Count -eq 0) {'OK'} else {'PARCIAL'}) "$($errores.Count) avisos"
             $form.Cursor = 'Default'
             & $refrescar
@@ -2195,7 +2350,9 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
 
     $btnGuardarCfg.Add_Click({
         try {
-            Guardar-Config ([pscustomobject]@{ rutaLogRed = $txtRed.Text.Trim() })
+            $cfg = Leer-Config
+            $cfg | Add-Member -NotePropertyName rutaLogRed -NotePropertyValue $txtRed.Text.Trim() -Force
+            Guardar-Config $cfg
             $lblBarra.Text = 'Configuracion guardada'
         } catch { [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, 'Error', 'OK', 'Error') | Out-Null }
     })
@@ -2208,37 +2365,8 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
 
     if ((Test-UwfInstalado) -and -not (Test-FiltroActivoAhora)) { $tabs.SelectedTab = $tabMant }
 
-    # Actualizacion automatica. La red va en un runspace para no bloquear la ventana; instalar y
-    # escribir en el log se hacen en el temporizador, en el hilo de la GUI.
-    $psAct = [powershell]::Create()
-    [void]$psAct.AddScript($script:BuscarActualizacion.ToString()).AddArgument($script:Version).
-        AddArgument($script:UrlRelease).AddArgument($script:AssetRelease).AddArgument($script:ScriptDest)
-    $tmrAct = New-Object System.Windows.Forms.Timer
-    $tmrAct.Interval = 1000
-    $tmrAct.Add_Tick({
-        if (-not $asyncAct.IsCompleted) { return }
-        $tmrAct.Stop()
-        try {
-            $res = @($psAct.EndInvoke($asyncAct))
-            if ($res.Count) {
-                Instalar-Actualizacion $res[0]
-                $lblBarra.Text = "Actualizada a $($res[0].Etiqueta): se usara la proxima vez que se abra la herramienta"
-            }
-        } catch {
-            # EndInvoke envuelve el error del runspace: el motivo real es la excepcion interna
-            $ex = $_.Exception
-            if ($ex.InnerException) { $ex = $ex.InnerException }
-            Escribir-Log 'BuscarActualizacion' 'ERROR' ((($ex.Message -replace ';', ',') -split '\s+') -join ' ')
-        }
-    })
-
     & $refrescar
-    $asyncAct = $psAct.BeginInvoke()
-    $tmrAct.Start()
     [void]$form.ShowDialog()
-    # Si la ventana se cierra a media descarga no se espera: se repite la proxima vez
-    $tmrAct.Stop()
-    if (-not $asyncAct.IsCompleted) { [void]$psAct.BeginStop($null, $null) }
 }
 
 # -----------------------------------------------------------------------------
@@ -2250,6 +2378,16 @@ if ($Vigilante) {
     # El modo vigilante ya no existe. Si la tarea de una version anterior sigue registrada,
     # se borra y se sale sin tocar el filtro.
     Eliminar-TareaAntigua
+    return
+}
+
+if ($Actualizar) {
+    # Lo lanza la tarea semanal, sin interfaz. Un fallo se reintenta en la siguiente ejecucion.
+    try {
+        Actualizar-DesdeRepositorio
+    } catch {
+        Escribir-Log 'BuscarActualizacion' 'ERROR' ((($_.Exception.Message -replace ';', ',') -split '\s+') -join ' ')
+    }
     return
 }
 
@@ -2279,6 +2417,14 @@ try {
          'seguira abriendo la version anterior. Cierra las demas ventanas de la ' +
          'herramienta y vuelve a ejecutar esta.'),
         'UWF Aulas', 'OK', 'Warning') | Out-Null
+}
+
+Endurecer-PermisosCarpeta
+try {
+    Asegurar-ExclusionCarpeta
+} catch {
+    # Add-ExclusionArchivo ya lo ha anotado en el log: se reintenta en la siguiente apertura
+    Escribir-Log 'Autoinstalacion' 'AVISO' ("exclusion de la carpeta: " + ((($_.Exception.Message -replace ';', ',') -split '\s+') -join ' '))
 }
 
 Mostrar-Interfaz
