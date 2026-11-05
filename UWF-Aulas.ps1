@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Vigilante,
     [switch]$Actualizar
 )
@@ -27,8 +27,8 @@ param(
 #  Cambios v6:
 #   - Actualizacion automatica: al activar la proteccion se registra la tarea semanal
 #     TareaActualizacion, que ejecuta este script con -Actualizar como SYSTEM. Descarga el
-#     .zip del repositorio y sustituye los ficheros de ExtensionesActualizables. La tarea
-#     nunca toca el filtro.
+#     AssetRelease de la release Latest, comprueba su SHA-256 con el que publica GitHub y
+#     sustituye los ficheros de ExtensionesActualizables. La tarea nunca toca el filtro.
 #   - La carpeta de trabajo se excluye sola de UWF (Asegurar-ExclusionCarpeta) para que lo
 #     actualizado sobreviva a los reinicios, y solo los administradores pueden escribir en ella.
 # =============================================================================
@@ -44,10 +44,10 @@ $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
 $script:TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
-$script:Version    = '7.2'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+$script:Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
 $script:TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver Registrar-TareaActualizacion
 $script:UrlRelease = 'https://api.github.com/repos/JoseMontanchez/UWFManager/releases/latest'
-$script:UrlZip     = 'https://github.com/JoseMontanchez/UWFManager/archive/refs/tags/{0}.zip'
+$script:AssetRelease = 'UWF-Aulas.zip'        # fichero que adjunta a cada release .github/workflows/release.yml
 $script:ExtensionesActualizables = @('.bat', '.ps1', '.py', '.spec', '.txt')
 $script:DiasEntreComprobaciones = 7            # dias minimos entre dos consultas a GitHub
 $script:Caracteristica = 'Client-UnifiedWriteFilter'
@@ -1097,14 +1097,17 @@ function Sustituir-Fichero([string]$Nuevo, [string]$Destino) {
 }
 
 function Actualizar-DesdeRepositorio {
-    # Lo que ejecuta la tarea semanal. Descarga el .zip del repositorio en la etiqueta de la
-    # ultima release, lo descomprime y sustituye en la carpeta de trabajo los ficheros de
+    # Lo que ejecuta la tarea semanal. Descarga el AssetRelease de la ultima release, comprueba
+    # su SHA-256, lo descomprime y sustituye en la carpeta de trabajo los ficheros de
     # ExtensionesActualizables. No toca el filtro ni la cola, y deja config.json intacto salvo
     # la fecha.
     #
-    # Usa la etiqueta y no la rama main para que solo llegue a las aulas lo publicado como
-    # Latest. GitHub no publica el SHA-256 de estos .zip: la unica comprobacion del contenido es
-    # que el .ps1 nuevo se pueda parsear y siga teniendo esta funcion.
+    # Usa la release Latest y no la rama main para que solo llegue a las aulas lo publicado.
+    # El SHA-256 esperado es el 'digest' que GitHub calcula al subir el fichero a la release:
+    # si falta o no coincide con lo descargado, no se instala nada. Protege de una descarga
+    # corrupta o alterada por el camino, no de alguien con acceso a la cuenta de GitHub (eso
+    # solo lo cubriria firmar el .ps1). Ademas, el .ps1 nuevo se tiene que poder parsear y
+    # seguir teniendo esta funcion.
     if (-not (Test-ComprobacionPendiente)) { return }
 
     # PowerShell 5.1 no activa TLS 1.2 por defecto y GitHub no acepta nada inferior
@@ -1118,6 +1121,15 @@ function Actualizar-DesdeRepositorio {
         return
     }
 
+    # Antes de descargar nada: sin SHA-256 publicado no hay con que comparar
+    $asset = @($release.assets | Where-Object { $_.name -ceq $script:AssetRelease }) | Select-Object -First 1
+    if (-not $asset) { throw "la release $etiqueta no trae $($script:AssetRelease)" }
+    $digest = ([string]$asset.digest).ToLower()
+    if ($digest -notmatch '^sha256:([0-9a-f]{64})$') {
+        throw "la release $etiqueta no publica el SHA-256 de $($script:AssetRelease)"
+    }
+    $huella = $Matches[1]
+
     # Lo que haya dejado una ejecucion cortada a medias
     Get-ChildItem -LiteralPath $script:Base -Directory -Filter 'descarga-*' -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -1128,11 +1140,15 @@ function Actualizar-DesdeRepositorio {
     try {
         $zip = Join-Path $temp 'repositorio.zip'
         $web.Headers.Add('User-Agent', 'UWFManager')
-        $web.DownloadFile(($script:UrlZip -f $etiqueta), $zip)
+        $web.DownloadFile([string]$asset.browser_download_url, $zip)
+        $recibido = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLower()
+        if ($recibido -ne $huella) {
+            throw "el SHA-256 de $($script:AssetRelease) de $etiqueta no coincide (esperado $huella, recibido $recibido)"
+        }
         $extraido = Join-Path $temp 'extraido'
         Expand-Archive -LiteralPath $zip -DestinationPath $extraido
 
-        # GitHub mete todo en una unica carpeta raiz, UWFManager-<etiqueta>
+        # La Action mete todo en una unica carpeta raiz, UWFManager
         $raices = @(Get-ChildItem -LiteralPath $extraido -Directory)
         if ($raices.Count -ne 1) { throw "el .zip de $etiqueta no tiene una unica carpeta raiz" }
         $raiz = $raices[0].FullName
@@ -1158,7 +1174,7 @@ function Actualizar-DesdeRepositorio {
             Copy-Item -LiteralPath $f.FullName -Destination $nuevo -Force
             Sustituir-Fichero $nuevo $destino
         }
-        Escribir-Log 'ActualizarInstalacion' 'OK' "actualizacion semanal a $etiqueta`: $($ficheros.Count) ficheros"
+        Escribir-Log 'ActualizarInstalacion' 'OK' "actualizacion semanal a $etiqueta`: $($ficheros.Count) ficheros, sha256 $huella"
         Anotar-Comprobacion
         # El .exe no viene en el .zip: el acceso directo pasa a abrir lo que se acaba de actualizar
         Crear-AccesoDirecto

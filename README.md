@@ -57,8 +57,9 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 - **Actualizacion automatica**: al activar la proteccion se registra la tarea semanal
   `UWF-Aulas-Actualizacion`. Mira la
   [ultima release](https://github.com/JoseMontanchez/UWFManager/releases) y, si es mas nueva,
-  descarga el `.zip` del repositorio en esa etiqueta, lo descomprime y sustituye los ficheros
-  `.bat`, `.ps1`, `.py`, `.spec` y `.txt`. La tarea nunca toca el filtro.
+  descarga su `UWF-Aulas.zip`, comprueba que su SHA-256 coincide con el que publica GitHub
+  (si no, no instala nada), lo descomprime y sustituye los ficheros `.bat`, `.ps1`, `.py`,
+  `.spec` y `.txt`. La tarea nunca toca el filtro.
 - **Carpeta excluida**: `C:\ProgramData\UWF-Aulas\` se anade sola a las exclusiones de UWF al
   abrir la herramienta y al preparar el equipo, sin pasar por la cola. Surte efecto tras el
   siguiente reinicio y solo los administradores pueden escribir en ella.

@@ -142,19 +142,24 @@ guardada; con el filtro activo el registro se perderia al reiniciar. Ejecuta
    ejecucion.
 2. Consulta en la API de GitHub la release *Latest* (excluye borradores y *pre-releases*). Si su
    etiqueta no es mayor que `$script:Version`, anota la fecha y termina.
-3. Descarga `archive/refs/tags/<etiqueta>.zip` a una carpeta temporal dentro de la de trabajo y
-   lo descomprime.
-4. Comprueba que `UWF-Aulas.ps1` existe, se puede parsear y sigue teniendo la funcion de
+3. Busca en la release el fichero `UWF-Aulas.zip` y su SHA-256, que GitHub calcula al subirlo
+   (campo `digest` de la API). Si falta alguno de los dos, no descarga nada.
+4. Descarga el `.zip` a una carpeta temporal dentro de la de trabajo, comprueba que su SHA-256
+   coincide (si no, lo borra y no instala nada) y lo descomprime.
+5. Comprueba que `UWF-Aulas.ps1` existe, se puede parsear y sigue teniendo la funcion de
    actualizacion.
-5. Sustituye en `C:\ProgramData\UWF-Aulas\` solo los ficheros `.bat`, `.ps1`, `.py`, `.spec` y
+6. Sustituye en `C:\ProgramData\UWF-Aulas\` solo los ficheros `.bat`, `.ps1`, `.py`, `.spec` y
    `.txt`, cada uno por renombrado y con `UWF-Aulas.ps1` el ultimo. Mientras la exclusion de la
    carpeta no surta efecto, los lleva al disco real con `uwfmgr file commit`.
-6. Rehace el acceso directo para que apunte a `UWF-Aulas.bat`.
+7. Rehace el acceso directo para que apunte a `UWF-Aulas.bat`.
 
 La tarea no toca el filtro, la cola ni `config.json` salvo la fecha, y un fallo se reintenta en
 la siguiente ejecucion (`BuscarActualizacion;ERROR` en el log).
 
-**El `.exe` no se actualiza**: el `.zip` del repositorio no lo incluye. Tras la primera
+El `UWF-Aulas.zip` lo genera y adjunta la Action `.github/workflows/release.yml` en cada
+release (`git archive` de la etiqueta). Una release creada a mano sin ese fichero no se instala.
+
+**El `.exe` no se actualiza**: el `UWF-Aulas.zip` no lo incluye. Tras la primera
 actualizacion, el equipo pasa a usar `UWF-Aulas.ps1`, que hace lo mismo; `UWF-Aulas.exe` se queda
 en la carpeta sin usar. Si despues se ejecuta un `.exe` desde un USB, el acceso directo vuelve a
 apuntar a el hasta la siguiente actualizacion.
@@ -475,10 +480,12 @@ Lo que el codigo cuida para no dejar un equipo del aula roto o desprotegido:
 - **Permisos de la carpeta de trabajo**: se ajustan al abrir la herramienta para que solo
   SYSTEM y los administradores escriban en `C:\ProgramData\UWF-Aulas\`. Lo que un usuario
   hubiera creado antes conserva sus propios permisos.
-- **Actualizacion sin firma ni hash**: GitHub no publica el SHA-256 de los `.zip` del
-  repositorio, asi que solo se comprueba que el `.ps1` se pueda parsear. Quien controle la
-  cuenta del repositorio puede ejecutar codigo como SYSTEM en todas las aulas, y una release
-  defectuosa llega a todas igual.
+- **Actualizacion con hash pero sin firma**: el SHA-256 del `UWF-Aulas.zip` se compara con
+  el que publica GitHub, lo que descarta una descarga corrupta o alterada por el camino. Pero
+  el hash y el fichero vienen de la misma cuenta: quien la controle puede publicar una release
+  con su propio hash y ejecutar codigo como SYSTEM en todas las aulas. Solo lo evitaria firmar
+  el `.ps1` y fijar la huella del certificado en el codigo. Una release defectuosa llega a
+  todas igual.
 - **Respaldo por texto**: si WMI no responde, el consumo del overlay y la lista de
   exclusiones se leen de la salida de `uwfmgr`; en ese caso no se distingue entre la sesion
   actual y la siguiente.

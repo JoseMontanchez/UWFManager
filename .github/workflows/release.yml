@@ -81,6 +81,21 @@ jobs:
           python -m PyInstaller --noconfirm --clean UWF-Aulas.spec
           if ($LASTEXITCODE -or -not (Test-Path dist\UWFManager.exe)) { throw 'PyInstaller ha fallado' }
 
+      - name: Empaquetar UWF-Aulas.zip
+        run: |
+          # Lo que descarga la tarea semanal de las aulas (AssetRelease en UWF-Aulas.ps1). Una
+          # unica carpeta raiz, como espera Actualizar-DesdeRepositorio.
+          $ErrorActionPreference = 'Continue'
+          git archive --format=zip --prefix=UWFManager/ -o dist\UWF-Aulas.zip HEAD
+          if ($LASTEXITCODE -or -not (Test-Path dist\UWF-Aulas.zip)) { throw 'git archive ha fallado' }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $z = [IO.Compression.ZipFile]::OpenRead((Resolve-Path dist\UWF-Aulas.zip))
+          try {
+              if (-not ($z.Entries | Where-Object FullName -ceq 'UWFManager/UWF-Aulas.ps1')) {
+                  throw 'UWF-Aulas.zip no trae UWFManager/UWF-Aulas.ps1'
+              }
+          } finally { $z.Dispose() }
+
       - name: Escanear con Defender
         id: defender
         run: |
@@ -103,17 +118,24 @@ jobs:
         id: hash
         run: |
           $h = (Get-FileHash dist\UWFManager.exe -Algorithm SHA256).Hash.ToLower()
+          $z = (Get-FileHash dist\UWF-Aulas.zip -Algorithm SHA256).Hash.ToLower()
           "sha256=$h" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
-          "SHA-256: $h"
+          "sha256zip=$z" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "SHA-256 UWFManager.exe: $h"
+          "SHA-256 UWF-Aulas.zip:  $z"
 
       - uses: actions/attest-build-provenance@v3
         with:
-          subject-path: dist/UWFManager.exe
+          subject-path: |
+            dist/UWFManager.exe
+            dist/UWF-Aulas.zip
 
       - uses: actions/upload-artifact@v6
         with:
           name: UWFManager-${{ github.ref_name }}
-          path: dist/UWFManager.exe
+          path: |
+            dist/UWFManager.exe
+            dist/UWF-Aulas.zip
 
       - name: Publicar release (Latest)
         if: startsWith(github.ref, 'refs/tags/')
@@ -127,19 +149,40 @@ jobs:
 
           SHA-256 de ``UWFManager.exe``: ``${{ steps.hash.outputs.sha256 }}``
 
+          SHA-256 de ``UWF-Aulas.zip`` (lo que instala la tarea semanal, que lo comprueba antes de
+          instalar): ``${{ steps.hash.outputs.sha256zip }}``
+
           Defender en el runner: ${{ steps.defender.outputs.resultado }}.
 
           Si Defender lo detecta en algun equipo, enviar este mismo ``.exe`` a Microsoft como
           falso positivo (ver README) y comprobarlo con ``Comprobar-Release.ps1``.
-          El origen se puede verificar con ``gh attestation verify UWFManager.exe --repo $env:GITHUB_REPOSITORY``.
+          El origen se puede verificar con ``gh attestation verify <fichero> --repo $env:GITHUB_REPOSITORY``.
           "@
+          $ficheros = @('dist\UWFManager.exe', 'dist\UWF-Aulas.zip')
+
+          # 1. Borrador: las aulas no lo ven hasta el paso 3
           gh release view $etiqueta *> $null
           if ($LASTEXITCODE -eq 0) {
-              # Si la release ya existia (creada a mano), se sustituye el .exe y se marca Latest
-              gh release upload $etiqueta dist\UWFManager.exe --clobber
-              if ($LASTEXITCODE -eq 0) { gh release edit $etiqueta --prerelease=false --latest }
+              # Si la release ya existia (creada a mano), se sustituyen los ficheros
+              gh release upload $etiqueta @ficheros --clobber
           } else {
-              gh release create $etiqueta dist\UWFManager.exe --latest `
+              gh release create $etiqueta @ficheros --draft `
                   --title "UWF Manager $etiqueta" --notes $notas
           }
+          if ($LASTEXITCODE) { throw 'No se ha podido subir la release' }
+
+          # 2. El SHA-256 que publica GitHub tiene que ser el del zip que acabamos de generar:
+          #    es con el que lo comparan las aulas
+          #    Los borradores no se encuentran por etiqueta: se buscan en la lista de releases
+          $lista = (gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=30") -join "`n" | ConvertFrom-Json
+          $release = $lista | Where-Object { $_.tag_name -ceq $etiqueta } | Select-Object -First 1
+          $zip = $release.assets | Where-Object { $_.name -ceq 'UWF-Aulas.zip' } | Select-Object -First 1
+          $esperado = 'sha256:${{ steps.hash.outputs.sha256zip }}'
+          "digest publicado: $($zip.digest)"
+          if ([string]$zip.digest -ne $esperado) {
+              throw "GitHub publica '$($zip.digest)' para UWF-Aulas.zip y deberia ser '$esperado': no se publica"
+          }
+
+          # 3. Publicar como Latest
+          gh release edit $etiqueta --draft=false --prerelease=false --latest
           if ($LASTEXITCODE) { throw 'No se ha podido publicar la release' }

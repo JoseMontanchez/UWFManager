@@ -24,7 +24,7 @@ Cambios v3:
 Cambios v6:
   - Actualizacion automatica: al activar la proteccion se registra la tarea semanal
     TareaActualizacion, que ejecuta 'UWF-Aulas.ps1 -Actualizar' como SYSTEM. La logica esta
-    solo en el .ps1: el .zip del repositorio no trae el .exe. La tarea nunca toca el filtro.
+    solo en el .ps1: el UWF-Aulas.zip de la release no trae el .exe. La tarea nunca toca el filtro.
   - La carpeta de trabajo se excluye sola de UWF (asegurar_exclusion_carpeta) para que lo
     actualizado sobreviva a los reinicios, y solo los administradores pueden escribir en ella.
 
@@ -71,7 +71,7 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
-Version    = '7.2'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
 TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver registrar_tarea_actualizacion
 ScriptPs1  = os.path.join(Base, 'UWF-Aulas.ps1')  # lo que ejecuta esa tarea
 
@@ -1300,6 +1300,15 @@ def _ps1_origen():
     return os.path.join(getattr(sys, '_MEIPASS', os.path.dirname(_script_origen())), 'UWF-Aulas.ps1')
 
 
+def _ps1_sabe_actualizarse(ruta):
+    """True si el .ps1 de 'ruta' existe y tiene la funcion que ejecuta la tarea semanal."""
+    try:
+        with open(ruta, encoding='utf-8-sig', errors='replace') as fh:
+            return 'function Actualizar-DesdeRepositorio' in fh.read()
+    except OSError:
+        return False
+
+
 def _xml_tarea_actualizacion():
     """Definicion de la tarea, identica a la de Get-XmlTareaActualizacion. Semanal porque el
     registro de tareas esta filtrado y con el filtro activo olvida su ultima ejecucion: con
@@ -1339,9 +1348,14 @@ def registrar_tarea_actualizacion():
     xml = ScriptPs1 + '.nuevo-tarea'
     try:
         endurecer_permisos_carpeta()
-        if not os.path.isfile(ScriptPs1):
+        # Se copia si falta y tambien si el que hay no sabe actualizarse (p. ej. el de la v5,
+        # que solo acepta -Vigilante): la tarea lo lanzaria con -Actualizar, fallaria al
+        # enlazar el parametro y el equipo no se actualizaria nunca, sin dejar rastro en el log.
+        # Si ya sabe actualizarse no se toca: puede ser mas nuevo que el que lleva este .exe.
+        if not _ps1_sabe_actualizarse(ScriptPs1):
             shutil.copy2(_ps1_origen(), ScriptPs1)
             persistir_en_disco(ScriptPs1)
+            escribir_log('ActualizarInstalacion', 'OK', 'UWF-Aulas.ps1 copiado para la tarea semanal')
         with open(xml, 'w', encoding='utf-16') as fh:
             fh.write(_xml_tarea_actualizacion())
         r = subprocess.run(['schtasks', '/create', '/tn', TareaActualizacion, '/xml', xml, '/f'],
