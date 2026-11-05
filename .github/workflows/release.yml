@@ -1,0 +1,144 @@
+# Compila UWFManager.exe, lo escanea con Defender y lo publica como pre-release.
+#
+# Se lanza al subir una etiqueta vN (v7, v7.1...). La release queda como *pre-release* a
+# proposito: la tarea semanal de las aulas solo mira la *Latest*, asi que nada llega a los
+# equipos hasta que alguien la marque como Latest a mano (ver "Publicar una version" en el
+# README). El envio a Microsoft como falso positivo sigue siendo manual: no hay API.
+#
+# Tambien se puede lanzar a mano (Actions > Release > Run workflow) para compilar sin publicar:
+# el .exe queda como artefacto de la ejecucion.
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write        # crear la release y subir el .exe
+  id-token: write        # atestacion de origen
+  attestations: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell   # PowerShell 5.1, el mismo en el que corre el .ps1 en las aulas
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Comprobar sintaxis
+        run: |
+          python -m py_compile UWF-Aulas.py
+          if ($LASTEXITCODE) { throw 'UWF-Aulas.py tiene errores de sintaxis' }
+          $errores = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path UWF-Aulas.ps1), [ref]$null, [ref]$errores)
+          if (@($errores).Count) {
+              $errores | ForEach-Object { "UWF-Aulas.ps1:$($_.Extent.StartLineNumber) $($_.Message)" }
+              throw 'UWF-Aulas.ps1 tiene errores de sintaxis'
+          }
+
+      - name: Comprobar que la etiqueta coincide con la version del codigo
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          # Una etiqueta que no coincide hace que los equipos se actualicen una y otra vez
+          # (o nunca): la tarea compara la etiqueta con $script:Version.
+          $etiqueta = '${{ github.ref_name }}'
+          if ($etiqueta -notmatch '^v(\d+(\.\d+){0,3})$') { throw "Etiqueta no valida: $etiqueta" }
+          $version = $Matches[1]
+          $n = @($version.Split('.')); while ($n.Count -lt 4) { $n += '0' }
+          $cuatro = $n -join '.'
+
+          $ps1 = [regex]::Match((Get-Content -Raw UWF-Aulas.ps1), "(?m)^\`$script:Version\s*=\s*'([^']+)'").Groups[1].Value
+          $py  = [regex]::Match((Get-Content -Raw UWF-Aulas.py), "(?m)^Version\s*=\s*'([^']+)'").Groups[1].Value
+          $txt = Get-Content -Raw version_info.txt
+          $fil = [regex]::Match($txt, "StringStruct\('FileVersion', '([^']+)'\)").Groups[1].Value
+          $pro = [regex]::Match($txt, "StringStruct\('ProductVersion', '([^']+)'\)").Groups[1].Value
+          $tup = [regex]::Match($txt, 'filevers=\(([^)]+)\)').Groups[1].Value -replace '\s', '' -replace ',', '.'
+
+          "etiqueta=$version ps1=$ps1 py=$py version_info=$fil/$pro/$tup"
+          $mal = @()
+          if ($ps1 -ne $version) { $mal += "UWF-Aulas.ps1 dice '$ps1'" }
+          if ($py  -ne $version) { $mal += "UWF-Aulas.py dice '$py'" }
+          if ($fil -ne $cuatro -or $pro -ne $cuatro -or $tup -ne $cuatro) { $mal += "version_info.txt no dice $cuatro" }
+          if ($mal) { throw "La etiqueta $etiqueta no coincide: $($mal -join ', ')" }
+
+      - name: Compilar
+        run: |
+          # Se comprueba $LASTEXITCODE a mano: con 'Stop' un aviso de pip en stderr cortaria el paso
+          $ErrorActionPreference = 'Continue'
+          python -m pip install --upgrade pip
+          python -m pip install wmi pywin32 "pyinstaller>=6.11,<7"
+          if ($LASTEXITCODE) { throw 'pip install ha fallado' }
+          python -m PyInstaller --noconfirm --clean UWF-Aulas.spec
+          if ($LASTEXITCODE -or -not (Test-Path dist\UWFManager.exe)) { throw 'PyInstaller ha fallado' }
+
+      - name: Escanear con Defender
+        id: defender
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # El escaneo local no ve el analisis en la nube, que es lo que suele disparar las
+          # detecciones '!ml': un resultado limpio aqui no garantiza que no lo detecte en un aula.
+          try { Update-MpSignature -ErrorAction Stop } catch { "No se han podido actualizar las firmas: $($_.Exception.Message)" }
+          .\Comprobar-Release.ps1 -Exe dist\UWFManager.exe
+          $codigo = $LASTEXITCODE
+          $texto = switch ($codigo) {
+              0 { 'sin deteccion local' }
+              1 { 'DETECTADO' }
+              default { 'sin comprobar (Defender no disponible en el runner)' }
+          }
+          "resultado=$texto" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          if ($codigo -eq 1) { throw 'Defender detecta el .exe: no se publica' }
+          exit 0   # 'sin comprobar' (2) no debe parar la publicacion
+
+      - name: SHA-256
+        id: hash
+        run: |
+          $h = (Get-FileHash dist\UWFManager.exe -Algorithm SHA256).Hash.ToLower()
+          "sha256=$h" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "SHA-256: $h"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/UWFManager.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UWFManager-${{ github.ref_name }}
+          path: dist/UWFManager.exe
+
+      - name: Publicar pre-release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $etiqueta = '${{ github.ref_name }}'
+          $notas = @"
+          Compilado por GitHub Actions desde $($env:GITHUB_SHA.Substring(0,7)).
+
+          SHA-256 de ``UWFManager.exe``: ``${{ steps.hash.outputs.sha256 }}``
+
+          Defender en el runner: ${{ steps.defender.outputs.resultado }}.
+
+          **Pendiente antes de marcarla como Latest**: enviar este mismo ``.exe`` a Microsoft como
+          falso positivo, probarlo en un equipo y comprobarlo con ``Comprobar-Release.ps1``.
+          El origen se puede verificar con ``gh attestation verify UWFManager.exe --repo $env:GITHUB_REPOSITORY``.
+          "@
+          gh release view $etiqueta *> $null
+          if ($LASTEXITCODE -eq 0) {
+              # Si la release ya existia (creada a mano), solo se sustituye el .exe
+              gh release upload $etiqueta dist\UWFManager.exe --clobber
+          } else {
+              gh release create $etiqueta dist\UWFManager.exe --prerelease --latest=false `
+                  --title "UWF Manager $etiqueta" --notes $notas
+          }
+          if ($LASTEXITCODE) { throw 'No se ha podido publicar la release' }
