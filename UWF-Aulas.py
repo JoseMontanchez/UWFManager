@@ -71,7 +71,7 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
-Version    = '7.1'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+Version    = '7.2'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
 TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver registrar_tarea_actualizacion
 ScriptPs1  = os.path.join(Base, 'UWF-Aulas.ps1')  # lo que ejecuta esa tarea
 

@@ -131,13 +131,22 @@ publique llega a todas las aulas. Para sacar la version `N`:
 
 1. Sube el numero en `Version` (`UWF-Aulas.py`), `$script:Version` (`UWF-Aulas.ps1`) y
    `version_info.txt`.
-2. Compila el `.exe` y ejecuta `.\Comprobar-Release.ps1` en un equipo con Defender activo.
-3. Crea en GitHub la release con la etiqueta `vN` (`v7` o `v7.1`), marcada como *pre-release*,
-   y adjunta **`UWFManager.exe`** para quien lo reparta por USB. La etiqueta debe apuntar a un
-   commit cuyo `UWF-Aulas.ps1` tenga ese mismo numero en `$script:Version`.
-4. Envia el `.exe` a Microsoft (ver abajo) y pruebalo en un equipo a mano.
-5. Cuando este limpio, marca la release como *Latest*: desde ese momento la tarea semanal la
-   instala en las aulas. Una *pre-release* queda fuera.
+2. Sube la etiqueta `vN` (`v7` o `v7.1`) en ese commit: `git tag vN` y `git push origin vN`.
+   La Action `.github/workflows/release.yml` hace el resto:
+   - comprueba la sintaxis y que la etiqueta coincide con las tres versiones del paso 1
+     (si no coinciden, no publica nada),
+   - compila `UWFManager.exe`, lo escanea con Defender (`Comprobar-Release.ps1`) y para si lo
+     detecta,
+   - publica la release directamente como **Latest** con el `.exe`, su SHA-256 y una
+     atestacion de origen (`gh attestation verify UWFManager.exe --repo <repo>`).
+
+   **Desde ese momento la tarea semanal la instala en las aulas**: sube la etiqueta solo
+   cuando la version este probada. El escaneo del runner no incluye el analisis en la nube:
+   un resultado limpio ahi no garantiza nada en las aulas. Para compilar sin publicar, usa
+   *Actions > Release > Run workflow* (el `.exe` queda como artefacto de la ejecucion).
+3. Si Defender detecta el `.exe` en algun equipo, envia **ese mismo** `.exe` de la release a
+   Microsoft (ver abajo): cada compilacion tiene un hash distinto, asi que no sirve uno
+   compilado en local.
 
 ### Falso positivo de Defender (`Program:Win32/Contebrew.A!ml`)
 

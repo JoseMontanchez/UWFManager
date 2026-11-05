@@ -1,9 +1,9 @@
-# Compila UWFManager.exe, lo escanea con Defender y lo publica como pre-release.
+# Compila UWFManager.exe, lo escanea con Defender y lo publica como release *Latest*.
 #
-# Se lanza al subir una etiqueta vN (v7, v7.1...). La release queda como *pre-release* a
-# proposito: la tarea semanal de las aulas solo mira la *Latest*, asi que nada llega a los
-# equipos hasta que alguien la marque como Latest a mano (ver "Publicar una version" en el
-# README). El envio a Microsoft como falso positivo sigue siendo manual: no hay API.
+# Se lanza al subir una etiqueta vN (v7, v7.1...). La release sale directamente como *Latest*:
+# la tarea semanal de las aulas la instalara en su siguiente comprobacion, sin esperar al envio
+# a Microsoft ni a una prueba manual. Si Defender del runner detecta el .exe, no se publica.
+# El envio a Microsoft como falso positivo sigue siendo manual: no hay API.
 #
 # Tambien se puede lanzar a mano (Actions > Release > Run workflow) para compilar sin publicar:
 # el .exe queda como artefacto de la ejecucion.
@@ -115,7 +115,7 @@ jobs:
           name: UWFManager-${{ github.ref_name }}
           path: dist/UWFManager.exe
 
-      - name: Publicar pre-release
+      - name: Publicar release (Latest)
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -129,16 +129,17 @@ jobs:
 
           Defender en el runner: ${{ steps.defender.outputs.resultado }}.
 
-          **Pendiente antes de marcarla como Latest**: enviar este mismo ``.exe`` a Microsoft como
-          falso positivo, probarlo en un equipo y comprobarlo con ``Comprobar-Release.ps1``.
+          Si Defender lo detecta en algun equipo, enviar este mismo ``.exe`` a Microsoft como
+          falso positivo (ver README) y comprobarlo con ``Comprobar-Release.ps1``.
           El origen se puede verificar con ``gh attestation verify UWFManager.exe --repo $env:GITHUB_REPOSITORY``.
           "@
           gh release view $etiqueta *> $null
           if ($LASTEXITCODE -eq 0) {
-              # Si la release ya existia (creada a mano), solo se sustituye el .exe
+              # Si la release ya existia (creada a mano), se sustituye el .exe y se marca Latest
               gh release upload $etiqueta dist\UWFManager.exe --clobber
+              if ($LASTEXITCODE -eq 0) { gh release edit $etiqueta --prerelease=false --latest }
           } else {
-              gh release create $etiqueta dist\UWFManager.exe --prerelease --latest=false `
+              gh release create $etiqueta dist\UWFManager.exe --latest `
                   --title "UWF Manager $etiqueta" --notes $notas
           }
           if ($LASTEXITCODE) { throw 'No se ha podido publicar la release' }
