@@ -3,7 +3,7 @@
 UWF Aulas v2 - gestion del Unified Write Filter para las aulas de la UV
 Port a Python del script original UWF-Aulas.ps1 (copia exacta de comportamiento).
 
-  Interfaz grafica para el tecnico. No hay ningun proceso en segundo plano: la proteccion
+  Interfaz grafica para el tecnico. Nada en segundo plano toca el filtro: la proteccion
   solo se desactiva y se reactiva cuando el tecnico lo pide.
 
 Cambios v2 (heredados del original):
@@ -20,6 +20,13 @@ Cambios v3:
     cola hasta que el tecnico pulsa "Finalizar" durante un mantenimiento.
   - En la interfaz, 'overlay' se llama "uso del disco". Internamente (WMI, uwfmgr y
     claves de los perfiles JSON) se conserva el termino de UWF.
+
+Cambios v6:
+  - Actualizacion automatica: al activar la proteccion se registra la tarea semanal
+    TareaActualizacion, que ejecuta 'UWF-Aulas.ps1 -Actualizar' como SYSTEM. La logica esta
+    solo en el .ps1: el UWF-Aulas.zip de la release no trae el .exe. La tarea nunca toca el filtro.
+  - La carpeta de trabajo se excluye sola de UWF (asegurar_exclusion_carpeta) para que lo
+    actualizado sobreviva a los reinicios, y solo los administradores pueden escribir en ella.
 
 Notas del port:
   - Para leer el estado de UWF se usa WMI (root\\standardcimv2\\embedded) via el
@@ -64,6 +71,9 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
+Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver registrar_tarea_actualizacion
+ScriptPs1  = os.path.join(Base, 'UWF-Aulas.ps1')  # lo que ejecuta esa tarea
 
 # Rutas que nunca deben excluirse: romperian las actualizaciones de Windows
 Prohibidas = [
@@ -251,8 +261,11 @@ def persistir_en_disco(ruta, borrado=False):
     """Lleva al disco real un fichero de la herramienta escrito (o borrado) con la proteccion
     activa. Sin esto se quedaba en el overlay y desaparecia al reiniciar: por ejemplo, la cola
     de pendientes no sobrevivia al reinicio que abre el mantenimiento. Con el filtro desactivado
-    no hace falta, porque ya se escribe directamente en el disco."""
+    no hace falta, porque ya se escribe directamente en el disco. Tampoco si la carpeta de
+    trabajo ya esta excluida en esta sesion."""
     if not filtro_activo_ahora():
+        return
+    if os.path.normcase(ruta).startswith(os.path.normcase(Base) + os.sep) and carpeta_excluida_ahora():
         return
     r = invoke_uwf(['file', 'commit-delete' if borrado else 'commit', ruta])
     if not r['Ok']:
@@ -595,6 +608,35 @@ def add_exclusion_archivo(ruta):
     escribir_log('AddExclusionArchivo', 'OK' if r['Ok'] else 'ERROR', ruta)
     if not r['Ok']:
         raise RuntimeError(r['Salida'])
+
+
+def _exclusion_carpeta():
+    """Datos de la exclusion de la carpeta de trabajo en get_exclusiones_detalle, o None."""
+    for d in get_exclusiones_detalle():
+        if d['Tipo'] == 'archivo' and d['Valor'].rstrip('\\').lower() == Base.lower():
+            return d
+    return None
+
+
+def carpeta_excluida_ahora():
+    """True si lo que se escribe en la carpeta de trabajo ya va directo al disco."""
+    d = _exclusion_carpeta()
+    return bool(d and d['Ahora'])
+
+
+def asegurar_exclusion_carpeta():
+    """Excluye de UWF la carpeta de trabajo si aun no lo esta, para que la copia instalada, la
+    configuracion y la cola sobrevivan a los reinicios sin depender de 'uwfmgr file commit'.
+
+    Es lo unico que llega a UWF sin pasar por la cola, y no toca el filtro ni la proteccion del
+    resto del disco. Surte efecto tras el siguiente reinicio: hasta entonces sigue haciendo
+    falta persistir_en_disco. Si alguien la quita, vuelve a anadirse al abrir la herramienta.
+    """
+    if not test_uwf_instalado():
+        return
+    d = _exclusion_carpeta()
+    if not (d and d['TrasReinicio']):
+        add_exclusion_archivo(Base)
 
 
 def remove_exclusion_archivo(ruta):
@@ -1165,26 +1207,18 @@ def eliminar_tarea_antigua():
 
 
 def _limpiar_restos():
-    """Borra los apartados .old-* de sustituciones anteriores y el .py suelto que pudiera
-    haber dejado una instalacion de desarrollo cuando ahora se ejecuta el .exe."""
+    """Borra los apartados .old-* de sustituciones anteriores y las descargas .nuevo-* que no
+    llegaron a instalarse."""
     borrados = []
     try:
         for nombre in os.listdir(Base):
             ruta = os.path.join(Base, nombre)
-            if '.old-' in nombre and os.path.isfile(ruta):
+            if ('.old-' in nombre or '.nuevo-' in nombre) and os.path.isfile(ruta):
                 try:
                     os.remove(ruta)
                     borrados.append(nombre)
                 except OSError:
                     pass          # sigue en uso: se intentara en la proxima ejecucion
-        if Congelado:
-            viejo_py = os.path.join(Base, 'UWF-Aulas.py')
-            if os.path.isfile(viejo_py):
-                try:
-                    os.remove(viejo_py)
-                    borrados.append('UWF-Aulas.py')
-                except OSError:
-                    pass
     except Exception:
         pass
     return borrados
@@ -1239,9 +1273,104 @@ def instalar_copia():
             # Con la proteccion activa la copia nueva se perderia al reiniciar
             persistir_en_disco(ScriptDest)
             escribir_log('ActualizarInstalacion', 'OK', '%s: %s' % (accion, detalle))
-        restos = _limpiar_restos()
-        if restos:
-            escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
+    # Fuera del if: tras una actualizacion automatica se arranca desde la propia copia instalada
+    restos = _limpiar_restos()
+    if restos:
+        escribir_log('LimpiarRestos', 'OK', ', '.join(restos))
+
+
+def endurecer_permisos_carpeta():
+    """Deja que solo SYSTEM y los administradores escriban en la carpeta de trabajo. Al estar
+    excluida de UWF, lo que un alumno dejara ahi con los permisos heredados de ProgramData
+    sobreviviria a los reinicios. Usa SID porque los nombres de grupo cambian con el idioma."""
+    try:
+        r = subprocess.run(['icacls', Base, '/inheritance:r', '/grant:r',
+                            '*S-1-5-18:(OI)(CI)F', '*S-1-5-32-544:(OI)(CI)F',
+                            '*S-1-5-32-545:(OI)(CI)RX'],
+                           capture_output=True, text=True, errors='replace', shell=False,
+                           **_sin_ventana())
+        if r.returncode != 0:
+            escribir_log('PermisosCarpeta', 'ERROR', 'icacls devolvio %d' % r.returncode)
+    except Exception as ex:
+        escribir_log('PermisosCarpeta', 'ERROR', ' '.join(str(ex).replace(';', ',').split()))
+
+
+def _ps1_origen():
+    """Ruta del UWF-Aulas.ps1 que se distribuye con esta version: dentro del .exe, o junto al .py."""
+    return os.path.join(getattr(sys, '_MEIPASS', os.path.dirname(_script_origen())), 'UWF-Aulas.ps1')
+
+
+def _ps1_sabe_actualizarse(ruta):
+    """True si el .ps1 de 'ruta' existe y tiene la funcion que ejecuta la tarea semanal."""
+    try:
+        with open(ruta, encoding='utf-8-sig', errors='replace') as fh:
+            return 'function Actualizar-DesdeRepositorio' in fh.read()
+    except OSError:
+        return False
+
+
+def _xml_tarea_actualizacion():
+    """Definicion de la tarea, identica a la de Get-XmlTareaActualizacion. Semanal porque el
+    registro de tareas esta filtrado y con el filtro activo olvida su ultima ejecucion: con
+    StartWhenAvailable puede arrancar de mas tras reiniciar, y por eso el .ps1 lleva su propia
+    cuenta de dias en config.json."""
+    powershell = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'),
+                              'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    argumentos = ('-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass '
+                  '-File "%s" -Actualizar' % ScriptPs1)
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo><Description>Actualiza UWF Aulas una vez a la semana. No toca el filtro.</Description></RegistrationInfo>\n'
+        '  <Triggers><CalendarTrigger>\n'
+        '    <StartBoundary>2026-01-05T12:00:00</StartBoundary>\n'
+        '    <ScheduleByWeek><DaysOfWeek><Monday /></DaysOfWeek><WeeksInterval>1</WeeksInterval></ScheduleByWeek>\n'
+        '  </CalendarTrigger></Triggers>\n'
+        '  <Principals><Principal id="Author"><UserId>S-1-5-18</UserId><RunLevel>HighestAvailable</RunLevel></Principal></Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <RunOnlyIfNetworkAvailable>true</RunOnlyIfNetworkAvailable>\n'
+        '    <ExecutionTimeLimit>PT30M</ExecutionTimeLimit>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>\n'
+        '</Task>\n' % (xml_escape(powershell), xml_escape(argumentos, {'"': '&quot;'}))
+    )
+
+
+def registrar_tarea_actualizacion():
+    """Registra la tarea semanal de actualizacion. Se llama al activar la proteccion: en ese
+    momento el filtro suele estar desactivado y el registro de tareas se guarda de verdad. No
+    lanza excepcion: un fallo aqui nunca debe impedir proteger el equipo. La tarea solo
+    actualiza ficheros; el filtro lo sigue activando y desactivando el tecnico."""
+    xml = ScriptPs1 + '.nuevo-tarea'
+    try:
+        endurecer_permisos_carpeta()
+        # Se copia si falta y tambien si el que hay no sabe actualizarse (p. ej. el de la v5,
+        # que solo acepta -Vigilante): la tarea lo lanzaria con -Actualizar, fallaria al
+        # enlazar el parametro y el equipo no se actualizaria nunca, sin dejar rastro en el log.
+        # Si ya sabe actualizarse no se toca: puede ser mas nuevo que el que lleva este .exe.
+        if not _ps1_sabe_actualizarse(ScriptPs1):
+            shutil.copy2(_ps1_origen(), ScriptPs1)
+            persistir_en_disco(ScriptPs1)
+            escribir_log('ActualizarInstalacion', 'OK', 'UWF-Aulas.ps1 copiado para la tarea semanal')
+        with open(xml, 'w', encoding='utf-16') as fh:
+            fh.write(_xml_tarea_actualizacion())
+        r = subprocess.run(['schtasks', '/create', '/tn', TareaActualizacion, '/xml', xml, '/f'],
+                           capture_output=True, text=True, errors='replace', shell=False,
+                           **_sin_ventana())
+        escribir_log('RegistrarTareaActualizacion', 'OK' if r.returncode == 0 else 'ERROR',
+                     ' '.join(((r.stdout or '') + (r.stderr or '')).replace(';', ',').split()))
+    except Exception as ex:
+        escribir_log('RegistrarTareaActualizacion', 'ERROR',
+                     ' '.join(str(ex).replace(';', ',').split()))
+    finally:
+        try:
+            os.remove(xml)
+        except OSError:
+            pass
 
 
 def crear_acceso_directo():
@@ -1301,6 +1430,7 @@ def finalizar_mantenimiento():
     if not r['Ok']:
         raise RuntimeError('No se ha podido activar el filtro: %s' % r['Salida'])
     escribir_log('FinalizarMantenimiento', 'OK', 'filtro activado, pendiente de reinicio')
+    registrar_tarea_actualizacion()
     return res
 
 
@@ -1400,8 +1530,10 @@ def instalar_caracteristica_uwf():
 
     dism = os.path.join(_system32(), 'dism.exe')
     try:
+        # '/all' habilita tambien la caracteristica padre (Client-DeviceLockdown). Sin ella
+        # DISM termina con el codigo 50 y deja UWF deshabilitado.
         codigo, salida = _ejecutar_oculto([dism, '/online', '/enable-feature',
-                                           '/featurename:' + Caracteristica,
+                                           '/featurename:' + Caracteristica, '/all',
                                            '/norestart', '/quiet', '/english'])
     except Exception as ex:
         codigo, salida = -1, str(ex)
@@ -1410,7 +1542,7 @@ def instalar_caracteristica_uwf():
     # 0 = hecho, 3010 = hecho pero pide reinicio
     if codigo not in (0, 3010):
         ps = os.path.join(_system32(), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-        orden = ("Enable-WindowsOptionalFeature -Online -FeatureName '%s' -NoRestart "
+        orden = ("Enable-WindowsOptionalFeature -Online -FeatureName '%s' -All -NoRestart "
                  "-ErrorAction Stop | Out-Null" % Caracteristica)
         try:
             codigo2, salida2 = _ejecutar_oculto([ps, '-NoProfile', '-NonInteractive',
@@ -1561,7 +1693,7 @@ def mostrar_interfaz():
     ROJO_FILA = '#A03C3C'
 
     form = tk.Tk()
-    form.title('UWF Aulas v2  -  %s' % os.environ.get('COMPUTERNAME', socket.gethostname()))
+    form.title('UWF Aulas v%s  -  %s' % (Version, os.environ.get('COMPUTERNAME', socket.gethostname())))
     form.geometry('940x700')
     form.minsize(820, 620)
     try:
@@ -1988,9 +2120,14 @@ def mostrar_interfaz():
                 raise RuntimeError('No se ha podido proteger C: con UWF:\n\n%s' % r['Salida'])
             u = get_estado_uwf()
             errores = aplicar_perfil(leer_perfil(), u['FiltroActual'])
+            try:
+                asegurar_exclusion_carpeta()
+            except Exception as ex:
+                errores.append('%s -> %s' % (Base, ex))
             r = invoke_uwf(['filter', 'enable'])
             if not r['Ok']:
                 raise RuntimeError('No se ha podido activar el filtro:\n\n%s' % r['Salida'])
+            registrar_tarea_actualizacion()
             escribir_log('PrepararEquipo', 'OK' if not errores else 'PARCIAL',
                          '%d avisos' % len(errores))
             form.config(cursor='')
@@ -2267,7 +2404,9 @@ def mostrar_interfaz():
     def on_guardar_cfg():
         """Boton 'Guardar configuracion' de la pestana Configuracion."""
         try:
-            guardar_config({'rutaLogRed': txt_red.get().strip()})
+            cfg = leer_config()
+            cfg['rutaLogRed'] = txt_red.get().strip()
+            guardar_config(cfg)
             lbl_barra.config(text='Configuracion guardada')
         except Exception as ex:
             messagebox.showerror('Error', str(ex))
@@ -2364,6 +2503,14 @@ def main(argv=None):
             'seguira abriendo la version anterior. Cierra las demas ventanas de la '
             'herramienta y vuelve a ejecutar esta.' % (ScriptDest, ex)
         )
+
+    endurecer_permisos_carpeta()
+    try:
+        asegurar_exclusion_carpeta()
+    except Exception as ex:
+        # add_exclusion_archivo ya lo ha anotado en el log: se reintenta en la siguiente apertura
+        escribir_log('Autoinstalacion', 'AVISO', 'exclusion de la carpeta: %s'
+                     % ' '.join(str(ex).replace(';', ',').split()))
 
     mostrar_interfaz()
     return 0

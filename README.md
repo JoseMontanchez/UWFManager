@@ -53,7 +53,16 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
   3. Finalizar y proteger -> aplica los cambios pendientes, reactiva el filtro y reinicia.
 
   La proteccion **no vuelve sola**: hasta pulsar *Finalizar*, el equipo sigue sin proteger y
-  la interfaz lo avisa en rojo. No hay ningun proceso en segundo plano.
+  la interfaz lo avisa en rojo. Nada en segundo plano toca el filtro.
+- **Actualizacion automatica**: al activar la proteccion se registra la tarea semanal
+  `UWF-Aulas-Actualizacion`. Mira la
+  [ultima release](https://github.com/JoseMontanchez/UWFManager/releases) y, si es mas nueva,
+  descarga su `UWF-Aulas.zip`, comprueba que su SHA-256 coincide con el que publica GitHub
+  (si no, no instala nada), lo descomprime y sustituye los ficheros `.bat`, `.ps1`, `.py`,
+  `.spec` y `.txt`. La tarea nunca toca el filtro.
+- **Carpeta excluida**: `C:\ProgramData\UWF-Aulas\` se anade sola a las exclusiones de UWF al
+  abrir la herramienta y al preparar el equipo, sin pasar por la cola. Surte efecto tras el
+  siguiente reinicio y solo los administradores pueden escribir en ella.
 - **Registro**: cada accion queda en un log CSV local (`C:\ProgramData\UWF-Aulas\uwf-aulas.log`)
   y, si se configura una ruta de red, tambien en un log centralizado por mes.
 
@@ -68,6 +77,7 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
 | `docs/FUNCIONAMIENTO.md` | Documentacion del funcionamiento interno. |
 | `UWF-Aulas.spec` | Configuracion de PyInstaller para compilar `UWF-Aulas.py` a un `.exe` standalone. |
 | `version_info.txt` | Datos de version del `.exe` (Propiedades > Detalles). |
+| `Comprobar-Release.ps1` | Escanea el `.exe` con Defender antes de publicarlo y muestra su SHA-256. |
 | `.claude/agents/` | Agentes de Claude Code del proyecto: paridad entre las dos implementaciones, revision de los invariantes de UWF, catalogo de exclusiones y empaquetado. |
 
 Estado que la herramienta guarda en el equipo, en `C:\ProgramData\UWF-Aulas\`:
@@ -82,11 +92,14 @@ cambios sin aplicar) y `uwf-aulas.log`.
   - Borra la tarea programada `UWF-Aulas-Vigilante` que registraban las versiones
     anteriores, si existe.
   - Crea el acceso directo `UWF Aulas.lnk` en el escritorio publico.
-- **Actualizar un equipo** es, por tanto, solo ejecutar la version nueva: compara por hash la
+- **Actualizar un equipo** es automatico desde la v6 (ver *Que hace* y
+  [Publicar una version](#publicar-una-version)). Tambien se puede actualizar a mano, ejecutando
+  la version nueva: compara por hash la
   copia instalada con la que se esta ejecutando y la sustituye si difieren. Como Windows no
   deja sobrescribir un ejecutable en uso, si esta abierto aparta el anterior a un
   `.old-<fecha>` que borra en la siguiente ejecucion. Si aun asi no pudiera sustituirlo,
   **avisa al tecnico**.
+- `-Actualizar` (solo en el `.ps1`) es lo que ejecuta la tarea semanal: no abre la GUI.
 - `-Vigilante` / `--vigilante` ya no hace nada salvo borrar la tarea antigua: solo existe
   para que la tarea de una version anterior, si reaparece, se elimine sin tocar el filtro.
 
@@ -111,3 +124,49 @@ evita que la linea de compilacion y lo versionado se separen.
 El resultado queda en `dist\UWFManager.exe`: un unico ejecutable, sin necesitar Python
 instalado en el equipo destino, que pide elevacion automaticamente al abrirse. El `.exe`
 no se versiona en el repositorio.
+
+## Publicar una version
+
+Los equipos se actualizan solos a partir de la release marcada como *Latest*, asi que lo que se
+publique llega a todas las aulas. Para sacar la version `N`:
+
+1. Sube el numero en `Version` (`UWF-Aulas.py`), `$script:Version` (`UWF-Aulas.ps1`) y
+   `version_info.txt`.
+2. Sube la etiqueta `vN` (`v7` o `v7.1`) en ese commit: `git tag vN` y `git push origin vN`.
+   La Action `.github/workflows/release.yml` hace el resto:
+   - comprueba la sintaxis y que la etiqueta coincide con las tres versiones del paso 1
+     (si no coinciden, no publica nada),
+   - compila `UWFManager.exe`, lo escanea con Defender (`Comprobar-Release.ps1`) y para si lo
+     detecta,
+   - publica la release directamente como **Latest** con el `.exe`, su SHA-256 y una
+     atestacion de origen (`gh attestation verify UWFManager.exe --repo <repo>`).
+
+   **Desde ese momento la tarea semanal la instala en las aulas**: sube la etiqueta solo
+   cuando la version este probada. El escaneo del runner no incluye el analisis en la nube:
+   un resultado limpio ahi no garantiza nada en las aulas. Para compilar sin publicar, usa
+   *Actions > Release > Run workflow* (el `.exe` queda como artefacto de la ejecucion).
+3. Si Defender detecta el `.exe` en algun equipo, envia **ese mismo** `.exe` de la release a
+   Microsoft (ver abajo): cada compilacion tiene un hash distinto, asi que no sirve uno
+   compilado en local.
+
+### Falso positivo de Defender (`Program:Win32/Contebrew.A!ml`)
+
+El sufijo `!ml` indica que lo clasifica un modelo de aprendizaje automatico, no una firma de
+malware conocido. Microsoft no publica que lo activa, asi que ningun cambio en la compilacion
+garantiza evitarlo. El `.spec` ya evita UPX e incluye datos de version.
+
+Lo que hay que hacer con cada version, porque cada compilacion tiene un hash nuevo:
+
+1. Entra en [Submit a file for malware analysis](https://www.microsoft.com/en-us/wdsi/filesubmission)
+   con la misma cuenta en cada envio.
+2. Envia `UWFManager.exe` como desarrollador de software, indicando que esta mal clasificado
+   ("should not be detected"), con el nombre de la deteccion y una descripcion de la herramienta.
+3. Sigue el resultado en el historial de envios de esa cuenta y comprueba con
+   `Comprobar-Release.ps1` cuando se hayan actualizado las definiciones.
+
+Firmar el `.exe` con un certificado de firma de codigo ayuda a ganar reputacion, y ademas
+permitiria comprobar la firma al actualizar, aunque no garantiza que desaparezca la deteccion.
+
+La herramienta **no** anade exclusiones de Defender ni oculta su contenido: dejaria sin
+proteccion los equipos del aula y es justo lo que hace el malware. Si el centro necesita
+permitirla, debe hacerlo su administrador por politica.

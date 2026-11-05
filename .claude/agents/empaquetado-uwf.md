@@ -64,6 +64,12 @@ un parche en el código.
 - **Pide elevación**: el `.exe` con `uac_admin=True` debe mostrar el escudo de UAC. Sin
   admin, las acciones de UWF fallan.
 - **Sintaxis antes de compilar**: `python -m py_compile UWF-Aulas.py`.
+- **Release**: `Version` (`.py`), `$script:Version` (`.ps1`), `version_info.txt` y la etiqueta
+  `vN` coinciden, y la release adjunta `UWFManager.exe` y `UWF-Aulas.ps1`. Lo publicado como
+  *Latest* se instala solo en todas las aulas (ver "Publicar una version" en el README).
+- **Defender**: `Comprobar-Release.ps1` en un equipo con Defender activo, y el `.exe` enviado a
+  Microsoft como falso positivo antes de marcarlo como *Latest*. Cada compilacion es un hash
+  nuevo, asi que el envio se repite en cada version.
 
 ## Límite de este entorno
 
