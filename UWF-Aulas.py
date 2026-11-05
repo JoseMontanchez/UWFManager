@@ -71,7 +71,7 @@ LogPath    = os.path.join(Base, 'uwf-aulas.log')
 ScriptDest = os.path.join(Base, 'UWF-Aulas.exe' if Congelado else 'UWF-Aulas.py')
 Uwfmgr     = os.path.join(os.environ.get('SystemRoot', r'C:\WINDOWS'), 'System32', 'uwfmgr.exe')
 TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
-Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+Version    = '7'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
 TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver registrar_tarea_actualizacion
 ScriptPs1  = os.path.join(Base, 'UWF-Aulas.ps1')  # lo que ejecuta esa tarea
 
@@ -1516,8 +1516,10 @@ def instalar_caracteristica_uwf():
 
     dism = os.path.join(_system32(), 'dism.exe')
     try:
+        # '/all' habilita tambien la caracteristica padre (Client-DeviceLockdown). Sin ella
+        # DISM termina con el codigo 50 y deja UWF deshabilitado.
         codigo, salida = _ejecutar_oculto([dism, '/online', '/enable-feature',
-                                           '/featurename:' + Caracteristica,
+                                           '/featurename:' + Caracteristica, '/all',
                                            '/norestart', '/quiet', '/english'])
     except Exception as ex:
         codigo, salida = -1, str(ex)
@@ -1526,7 +1528,7 @@ def instalar_caracteristica_uwf():
     # 0 = hecho, 3010 = hecho pero pide reinicio
     if codigo not in (0, 3010):
         ps = os.path.join(_system32(), 'WindowsPowerShell', 'v1.0', 'powershell.exe')
-        orden = ("Enable-WindowsOptionalFeature -Online -FeatureName '%s' -NoRestart "
+        orden = ("Enable-WindowsOptionalFeature -Online -FeatureName '%s' -All -NoRestart "
                  "-ErrorAction Stop | Out-Null" % Caracteristica)
         try:
             codigo2, salida2 = _ejecutar_oculto([ps, '-NoProfile', '-NonInteractive',

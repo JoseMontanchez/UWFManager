@@ -56,7 +56,7 @@ garantias de seguridad y diagnostico de problemas) esta explicado en
   la interfaz lo avisa en rojo. Nada en segundo plano toca el filtro.
 - **Actualizacion automatica**: al activar la proteccion se registra la tarea semanal
   `UWF-Aulas-Actualizacion`. Mira la
-  [ultima release](https://github.com/JoseMontanchez/UWFManager/releases) y, si es mas nueva,
+  [ultima release](https://github.com/capea6/UWFManager/releases) y, si es mas nueva,
   descarga el `.zip` del repositorio en esa etiqueta, lo descomprime y sustituye los ficheros
   `.bat`, `.ps1`, `.py`, `.spec` y `.txt`. La tarea nunca toca el filtro.
 - **Carpeta excluida**: `C:\ProgramData\UWF-Aulas\` se anade sola a las exclusiones de UWF al

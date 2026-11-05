@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$Vigilante,
     [switch]$Actualizar
 )
@@ -44,10 +44,10 @@ $script:LogPath    = Join-Path $script:Base 'uwf-aulas.log'
 $script:ScriptDest = Join-Path $script:Base 'UWF-Aulas.ps1'
 $script:Uwfmgr     = Join-Path $env:SystemRoot 'System32\uwfmgr.exe'
 $script:TareaAntigua = 'UWF-Aulas-Vigilante'   # tarea de arranque de versiones anteriores; se borra al abrir
-$script:Version    = '6'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
+$script:Version    = '7'                       # subirlo en cada release: su etiqueta en GitHub es v<Version>
 $script:TareaActualizacion = 'UWF-Aulas-Actualizacion'   # tarea semanal; ver Registrar-TareaActualizacion
-$script:UrlRelease = 'https://api.github.com/repos/JoseMontanchez/UWFManager/releases/latest'
-$script:UrlZip     = 'https://github.com/JoseMontanchez/UWFManager/archive/refs/tags/{0}.zip'
+$script:UrlRelease = 'https://api.github.com/repos/capea6/UWFManager/releases/latest'
+$script:UrlZip     = 'https://github.com/capea6/UWFManager/archive/refs/tags/{0}.zip'
 $script:ExtensionesActualizables = @('.bat', '.ps1', '.py', '.spec', '.txt')
 $script:DiasEntreComprobaciones = 7            # dias minimos entre dos consultas a GitHub
 $script:Caracteristica = 'Client-UnifiedWriteFilter'
@@ -1266,8 +1266,20 @@ function Finalizar-Mantenimiento {
 }
 
 function Reiniciar-Equipo([string]$motivo) {
-    Escribir-Log 'Reinicio' 'OK' $motivo
-    Start-Process -FilePath 'shutdown.exe' -ArgumentList '/r','/t','10','/c',"UWF Aulas: $motivo" -WindowStyle Hidden
+    # Llamada directa y no Start-Process: en PowerShell 5.1 Start-Process no entrecomilla los
+    # argumentos con espacios, el comentario de /c llegaba partido y shutdown lo rechazaba sin
+    # reiniciar. Se comprueba el codigo de salida para no anotar un reinicio que no ha ocurrido.
+    $r = Invoke-Oculto (Join-Path (Get-System32) 'shutdown.exe') @('/r','/t','10','/c',"UWF Aulas: $motivo")
+    if ($r.Codigo -eq 0) {
+        Escribir-Log 'Reinicio' 'OK' $motivo
+        return
+    }
+    $detalle = (($r.Salida -replace ';', ',') -replace '\s+', ' ').Trim()
+    Escribir-Log 'Reinicio' 'ERROR' "$motivo, shutdown codigo=$($r.Codigo) $detalle"
+    [System.Windows.Forms.MessageBox]::Show(
+        ("No se ha podido reiniciar el equipo (shutdown codigo $($r.Codigo)).`n`n" +
+         'Los cambios ya estan guardados: reinicia a mano para que surtan efecto.'),
+        'UWF Aulas', 'OK', 'Warning') | Out-Null
 }
 
 # -----------------------------------------------------------------------------
@@ -1349,7 +1361,9 @@ function Instalar-CaracteristicaUwf {
     $algunoOk = $false
 
     $dism = Join-Path (Get-System32) 'dism.exe'
-    $r = Invoke-Oculto $dism @('/online','/enable-feature',"/featurename:$script:Caracteristica",'/norestart','/quiet','/english')
+    # '/all' habilita tambien la caracteristica padre (Client-DeviceLockdown). Sin ella DISM
+    # termina con el codigo 50 y deja UWF deshabilitado.
+    $r = Invoke-Oculto $dism @('/online','/enable-feature',"/featurename:$script:Caracteristica",'/all','/norestart','/quiet','/english')
     [void]$intentos.Add((& $resumir 'dism' $r))
 
     # 0 = hecho, 3010 = hecho pero pide reinicio
@@ -1357,7 +1371,7 @@ function Instalar-CaracteristicaUwf {
         $algunoOk = $true
     } else {
         $ps = Join-Path (Get-System32) 'WindowsPowerShell\v1.0\powershell.exe'
-        $orden = "Enable-WindowsOptionalFeature -Online -FeatureName '$script:Caracteristica' -NoRestart -ErrorAction Stop | Out-Null"
+        $orden = "Enable-WindowsOptionalFeature -Online -FeatureName '$script:Caracteristica' -All -NoRestart -ErrorAction Stop | Out-Null"
         $r2 = Invoke-Oculto $ps @('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-Command',$orden)
         [void]$intentos.Add((& $resumir 'powershell' $r2))
         if (@(0, 3010) -contains $r2.Codigo) { $algunoOk = $true }
