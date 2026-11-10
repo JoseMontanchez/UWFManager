@@ -298,6 +298,7 @@ def get_estado_uwf():
         'Instalado':        test_uwf_instalado(),
         'FiltroActual':     False,
         'FiltroSiguiente':  False,
+        'FiltroLeido':      False,   # False = WMI aun no ha respondido (tipico justo tras arrancar)
         'VolumenesActual':  [],
         'OverlayTipo':      'desconocido',
         'OverlayMaxMB':     0,
@@ -318,6 +319,9 @@ def get_estado_uwf():
         if f:
             r['FiltroActual']    = bool(f[0].CurrentEnabled)
             r['FiltroSiguiente'] = bool(f[0].NextEnabled)
+            r['FiltroLeido']     = True
+        else:
+            raise RuntimeError('UWF todavia no responde')
 
         vols = [
             v for v in (conn.UWF_Volume() or [])
@@ -1901,12 +1905,30 @@ def mostrar_interfaz():
     btn_abrir_carpeta.place(x=228, y=90, width=240, height=34)
 
     # ============================ LOGICA GUI =================================
+    reintentos = [0]
+
     def refrescar():
         """Vuelve a leer el estado de UWF y la cola de pendientes, y redibuja toda la ventana:
         banner, pestana Estado, campos de Uso del disco, lista de Exclusiones (pendientes
         incluidos), barra de pendientes y las ultimas lineas del log."""
         try:
             u = get_estado_uwf()
+            # Justo tras el arranque WMI de UWF puede tardar en responder; sin esto el estado
+            # quedaba en "desactivado" y se mostraba un mantenimiento falso. Se reintenta solo.
+            if u['Instalado'] and not u['FiltroLeido']:
+                reintentos[0] += 1
+                banner.config(bg=NARANJA); lbl_banner.config(bg=NARANJA,
+                    text='COMPROBANDO EL ESTADO DE LA PROTECCION...')
+                lbl_fase.config(text=lbl_banner.cget('text'))
+                btn_iniciar_m.config(state='disabled'); btn_finalizar_m.config(state='disabled')
+                if reintentos[0] <= 40:
+                    form.after(3000, refrescar)
+                else:
+                    lbl_barra.config(text='No se pudo leer el estado de UWF: %s. Pulsa Actualizar.' % u['Error'])
+                return
+            if reintentos[0] and not u['FiltroActual']:
+                tabs.select(tab_mant)
+            reintentos[0] = 0
             pend = leer_pendientes()
             lineas_pend = resumen_pendientes(pend)
 
@@ -2440,7 +2462,8 @@ def mostrar_interfaz():
     cfg = leer_config()
     txt_red.insert(0, str(cfg.get('rutaLogRed', '')))
 
-    if test_uwf_instalado() and not filtro_activo_ahora():
+    u0 = get_estado_uwf()
+    if u0['Instalado'] and u0['FiltroLeido'] and not u0['FiltroActual']:
         tabs.select(tab_mant)
 
     refrescar()

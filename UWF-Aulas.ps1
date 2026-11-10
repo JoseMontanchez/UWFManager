@@ -221,6 +221,7 @@ function Get-EstadoUwf {
         Instalado        = (Test-UwfInstalado)
         FiltroActual     = $false
         FiltroSiguiente  = $false
+        FiltroLeido      = $false   # $false = WMI aun no ha respondido (tipico justo tras arrancar)
         VolumenesActual  = @()
         OverlayTipo      = 'desconocido'
         OverlayMaxMB     = 0
@@ -234,8 +235,10 @@ function Get-EstadoUwf {
     try {
         $ns = 'root\standardcimv2\embedded'
         $f  = Get-CimInstance -Namespace $ns -ClassName UWF_Filter -ErrorAction Stop
+        if (-not $f) { throw 'UWF todavia no responde' }
         $r.FiltroActual    = [bool]$f.CurrentEnabled
         $r.FiltroSiguiente = [bool]$f.NextEnabled
+        $r.FiltroLeido     = $true
 
         $vols = Get-CimInstance -Namespace $ns -ClassName UWF_Volume -ErrorAction SilentlyContinue |
                 Where-Object { $_.CurrentSession -eq $true -and $_.BindByDriveLetter -eq $true -and $_.ProtectionEnabled -eq $true }
@@ -1871,9 +1874,28 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
     $tabCfg.Controls.AddRange(@($lblRed, $txtRed, $btnGuardarCfg, $btnAbrirCarpeta))
 
     # ============================ LOGICA GUI =================================
+    # Justo tras el arranque WMI de UWF puede tardar en responder; sin esto el estado quedaba
+    # en "desactivado" y se mostraba un mantenimiento falso. Se reintenta solo cada 3 s.
+    $script:reintentosEstado = 0
+    $timerReintento = New-Object System.Windows.Forms.Timer
+    $timerReintento.Interval = 3000
+    $timerReintento.Add_Tick({ $timerReintento.Stop(); & $refrescar })
+
     $refrescar = {
         try {
             $u  = Get-EstadoUwf
+            if ($u.Instalado -and -not $u.FiltroLeido) {
+                $script:reintentosEstado++
+                $banner.BackColor  = [System.Drawing.Color]::FromArgb(200, 130, 0)
+                $lblBanner.Text    = 'COMPROBANDO EL ESTADO DE LA PROTECCION...'
+                $lblFase.Text      = $lblBanner.Text
+                $btnIniciarM.Enabled = $false; $btnFinalizarM.Enabled = $false
+                if ($script:reintentosEstado -le 40) { $timerReintento.Start() }
+                else { $lblBarra.Text = 'No se pudo leer el estado de UWF: ' + $u.Error + '. Pulsa Actualizar.' }
+                return
+            }
+            if ($script:reintentosEstado -and -not $u.FiltroActual) { $tabs.SelectedTab = $tabMant }
+            $script:reintentosEstado = 0
             $pend = Leer-Pendientes
             $lineasPend = @(Get-ResumenPendientes $pend)
 
@@ -2393,7 +2415,8 @@ en todos los arranques. No dejes el aula sin cerrar el mantenimiento.
     $cfg = Leer-Config
     $txtRed.Text   = [string]$cfg.rutaLogRed
 
-    if ((Test-UwfInstalado) -and -not (Test-FiltroActivoAhora)) { $tabs.SelectedTab = $tabMant }
+    $u0 = Get-EstadoUwf
+    if ($u0.Instalado -and $u0.FiltroLeido -and -not $u0.FiltroActual) { $tabs.SelectedTab = $tabMant }
 
     & $refrescar
     [void]$form.ShowDialog()
